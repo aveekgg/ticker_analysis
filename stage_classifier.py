@@ -191,12 +191,73 @@ def classify(daily: pd.DataFrame, params: dict = None) -> pd.DataFrame:
 
 
 def get_transitions(classified_weekly: pd.DataFrame) -> pd.DataFrame:
-    """First week each stage was newly confirmed (i.e. where the smoothed label changes)."""
+    """First week each stage was newly confirmed (i.e. where the smoothed label changes).
+
+    Includes `ma30w_slope_pct` at the confirming week as a momentum score —
+    used by the backtester to rank same-period entry signals.
+    """
     w = classified_weekly.dropna(subset=["stage"]).copy()
     if w.empty:
-        return pd.DataFrame(columns=["date", "stage", "close", "stage_name"])
+        return pd.DataFrame(columns=["date", "stage", "close", "stage_name", "ma30w_slope_pct"])
     changed = w["stage"] != w["stage"].shift(1)
-    out = w.loc[changed, ["close"]].reset_index().rename(columns={"index": "date"})
+    out = w.loc[changed, ["close", "ma30w_slope_pct"]].reset_index().rename(columns={"index": "date"})
     out["stage"] = w.loc[changed, "stage"].astype(int).values
     out["stage_name"] = out["stage"].map(STAGE_NAMES)
+    return out
+
+
+def daily_overlay(daily: pd.DataFrame, params: dict = None) -> pd.DataFrame:
+    """Daily-aligned 30w/200d/50d MA lines (+ a 30w whipsaw-band envelope)
+    for chart overlays. Cheaper than `classify()` since it skips the slope
+    and volume calculations that are only needed for stage rules."""
+    p = {**DEFAULTS, **(params or {})}
+    d = daily.sort_values("date").set_index("date").copy()
+
+    d["ma200"] = d["close"].rolling(p["daily_ma200_window"]).mean()
+    d["ma50"] = d["close"].rolling(p["daily_ma50_window"]).mean()
+
+    weekly_close = d["close"].resample("W-FRI").last()
+    ma30w_weekly = weekly_close.rolling(p["weekly_ma_window"]).mean()
+    d["ma30w"] = ma30w_weekly.reindex(d.index, method="ffill")
+
+    band = p["whipsaw_band_pct"] / 100
+    d["ma30w_upper"] = d["ma30w"] * (1 + band)
+    d["ma30w_lower"] = d["ma30w"] * (1 - band)
+
+    return d[["ma30w", "ma30w_upper", "ma30w_lower", "ma200", "ma50"]].reset_index()
+
+
+def scan_universe(price_frames: dict, params: dict = None, progress_cb=None) -> pd.DataFrame:
+    """Classify every symbol in `price_frames` (dict of symbol -> daily
+    DataFrame) and return all their stage transitions concatenated, with a
+    `symbol` column. Used by the stage screener and the backtester so both
+    features work off the same underlying classification.
+    """
+    rows = []
+    failures = 0
+    total = len(price_frames)
+    for i, (symbol, daily) in enumerate(price_frames.items()):
+        try:
+            if "date" not in daily.columns:
+                daily = daily.reset_index()
+            classified = classify(daily, params)
+            trans = get_transitions(classified)
+            if not trans.empty:
+                trans.insert(0, "symbol", symbol)
+                rows.append(trans)
+        except Exception:
+            failures += 1  # illiquid/short-history symbols can fail indicator warmup; skip them
+        if progress_cb:
+            progress_cb((i + 1) / total)
+
+    if total and failures == total:
+        # every single symbol errored -- almost certainly a bug (bad input shape,
+        # wrong column names) rather than genuinely bad data, so fail loudly
+        # instead of silently returning a broken empty result.
+        raise RuntimeError(f"scan_universe: all {total} symbols failed to classify — check price_frames format")
+
+    if not rows:
+        return pd.DataFrame(columns=["symbol", "date", "stage", "close", "stage_name", "ma30w_slope_pct"])
+    out = pd.concat(rows, ignore_index=True)
+    out["date"] = pd.to_datetime(out["date"])
     return out

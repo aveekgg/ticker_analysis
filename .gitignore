@@ -8,6 +8,7 @@
 !README.md
 !market_data_app.py
 !stage_classifier.py
+!backtester.py
 !nse_market_data.duckdb
 !.streamlit/
 !.streamlit/**

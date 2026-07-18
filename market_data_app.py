@@ -1,12 +1,17 @@
 """
-Local UI for querying nse_market_data.duckdb and viewing price charts.
+Local UI for querying nse_market_data.duckdb, viewing price charts, screening
+stocks by Weinstein stage, and backtesting a Stage-2/3/4 trading strategy.
 
 Run:
     streamlit run market_data_app.py
 
-Two tabs:
-    Charts - pick a symbol (or several), see a candlestick + volume chart
-    Query  - run arbitrary SQL against the DuckDB file, view/export results
+Tabs:
+    Charts          - candlestick + volume + MA overlay for one symbol, with
+                       stage annotations
+    Stage screener  - which stocks entered a given stage in a date window
+    Strategy backtest - simulate the Stage-2 entry / Stage-3-4-or-stop-loss
+                       exit strategy across the full universe
+    Query / Tables  - run arbitrary SQL against the DuckDB file
 """
 
 import duckdb
@@ -15,6 +20,7 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import streamlit as st
 
+import backtester as bt
 import stage_classifier as sc
 
 DB_FILE = "nse_market_data.duckdb"
@@ -38,201 +44,382 @@ def get_symbols():
 @st.cache_data
 def get_prices(symbol: str) -> pd.DataFrame:
     con = get_connection()
-    return con.execute(
+    df = con.execute(
         "SELECT date, open, high, low, close, volume FROM daily_prices "
         "WHERE tradingsymbol = ? ORDER BY date", [symbol]
     ).df()
+    df["date"] = pd.to_datetime(df["date"])
+    return df
+
+
+@st.cache_resource(show_spinner="Loading full price history (first time only)...")
+def get_price_frames() -> dict:
+    """symbol -> daily DataFrame indexed by date. Loaded once for the whole
+    universe; only triggered when the Screener or Backtest tab is used."""
+    frames = {}
+    for symbol in get_symbols():
+        df = get_prices(symbol)
+        if df.empty:
+            continue
+        frames[symbol] = df.set_index("date").sort_index()
+    return frames
 
 
 @st.cache_data
 def get_stage_transitions(symbol: str, params: dict) -> pd.DataFrame:
     daily = get_prices(symbol)
-    daily["date"] = pd.to_datetime(daily["date"])
     classified = sc.classify(daily, params)
     return sc.get_transitions(classified)
 
 
+@st.cache_data(show_spinner="Scanning the full universe for stage transitions (can take ~a minute the first time)...")
+def get_universe_transitions(params: dict) -> pd.DataFrame:
+    frames = get_price_frames()
+    return sc.scan_universe(frames, params)
+
+
 def render_stage_help(params: dict):
     """Plain-language explainer for the Stage 1-4 framework and what the
-    current slider settings mean, shown in the right-hand help panel."""
-    with st.container(border=True):
-        st.markdown("#### :material/school: What are Stage 1-4?")
-        st.markdown(
-            "This labels a stock's long-term trend using **Stan Weinstein's stage "
-            "analysis** — a way of reading where a stock is in its cycle by looking "
-            "at its 30-week moving average (a smoothed line of the last ~30 weeks "
-            "of prices). Think of it like four seasons a stock moves through:"
-        )
-        st.markdown(
-            f"- :gray[**Stage 1 — Base**] :gray[(quiet)]: the stock goes nowhere. "
-            f"Price chops sideways, the 30-week average is flat, and volume dries up. "
-            f"The calm before a move.\n"
-            f"- :green[**Stage 2 — Advance**] :green[(uptrend)]: the stock breaks out "
-            f"and climbs. Price stays above a *rising* 30-week average, with strong "
-            f"volume on the up-moves. This is the phase trend-followers want to catch.\n"
-            f"- :orange[**Stage 3 — Top**] :orange[(warning)]: the rally loses steam. "
-            f"Price starts closing below its short-term average on heavy volume, or a "
-            f"new high fails and price falls back — often a sign big holders are selling.\n"
-            f"- :red[**Stage 4 — Decline**] :red[(downtrend)]: the trend turns down. "
-            f"Price sits below a *falling* 30-week average. This is the correction phase."
-        )
-        st.caption("Stocks typically cycle 1 → 2 → 3 → 4 → back to 1, though they can skip or revisit stages.")
+    current slider settings mean."""
+    st.markdown("#### :material/school: What are Stage 1-4?")
+    st.markdown(
+        "This labels a stock's long-term trend using **Stan Weinstein's stage "
+        "analysis** — a way of reading where a stock is in its cycle by looking "
+        "at its 30-week moving average (a smoothed line of the last ~30 weeks "
+        "of prices). Think of it like four seasons a stock moves through:"
+    )
+    st.markdown(
+        f"- :gray[**Stage 1 — Base**] :gray[(quiet)]: the stock goes nowhere. "
+        f"Price chops sideways, the 30-week average is flat, and volume dries up. "
+        f"The calm before a move.\n"
+        f"- :green[**Stage 2 — Advance**] :green[(uptrend)]: the stock breaks out "
+        f"and climbs. Price stays above a *rising* 30-week average, with strong "
+        f"volume on the up-moves. This is the phase trend-followers want to catch.\n"
+        f"- :orange[**Stage 3 — Top**] :orange[(warning)]: the rally loses steam. "
+        f"Price starts closing below its short-term average on heavy volume, or a "
+        f"new high fails and price falls back — often a sign big holders are selling.\n"
+        f"- :red[**Stage 4 — Decline**] :red[(downtrend)]: the trend turns down. "
+        f"Price sits below a *falling* 30-week average. This is the correction phase."
+    )
+    st.caption("Stocks typically cycle 1 → 2 → 3 → 4 → back to 1, though they can skip or revisit stages.")
 
-        st.divider()
-        st.markdown("#### :material/tune: What your current settings mean")
-        st.markdown(
-            f"- A trend counts as **\"flat\"** if the 30-week average moves less than "
-            f"**{params['weekly_flat_pct']}% per week** (or a daily average moves less "
-            f"than **{params['daily_flat_pct']}% per day**). Anything faster than that "
-            f"counts as clearly rising or falling — lower this to call fewer trends \"flat\"."
-        )
-        st.markdown(
-            f"- **Stage 1** requires price to stay within **{params['whipsaw_band_pct']}%** "
-            f"of the 30-week average. A wider band lets more sideways chop still count as \"basing\"."
-        )
-        st.markdown(
-            f"- **Stage 2** needs breakout volume at least **{params['breakout_vol_mult']}x** "
-            f"its 50-day average — raise this to only flag stronger, more convincing breakouts."
-        )
-        st.markdown(
-            f"- **Stage 3** fires on a down week with volume at least "
-            f"**{params['distribution_vol_mult']}x** its 50-day average, or on a "
-            f"**failed breakout**: a new high that gives back more than "
-            f"**{params['failed_breakout_giveback_pct']}%** within a few weeks."
-        )
-        st.markdown(
-            f"- A stage must hold for **{params['min_run_weeks']} consecutive week"
-            f"{'s' if params['min_run_weeks'] != 1 else ''}** before it's confirmed and "
-            f"annotated on the chart. This is what filters out noisy single-week wiggles — "
-            f"raise it for fewer, more confident transitions; lower it to catch changes earlier."
-        )
+    st.divider()
+    st.markdown("#### :material/tune: What your current settings mean")
+    st.markdown(
+        f"- A trend counts as **\"flat\"** if the 30-week average moves less than "
+        f"**{params['weekly_flat_pct']}% per week** (or a daily average moves less "
+        f"than **{params['daily_flat_pct']}% per day**). Anything faster than that "
+        f"counts as clearly rising or falling — lower this to call fewer trends \"flat\"."
+    )
+    st.markdown(
+        f"- **Stage 1** requires price to stay within **{params['whipsaw_band_pct']}%** "
+        f"of the 30-week average. A wider band lets more sideways chop still count as \"basing\"."
+    )
+    st.markdown(
+        f"- **Stage 2** needs breakout volume at least **{params['breakout_vol_mult']}x** "
+        f"its 50-day average — raise this to only flag stronger, more convincing breakouts."
+    )
+    st.markdown(
+        f"- **Stage 3** fires on a down week with volume at least "
+        f"**{params['distribution_vol_mult']}x** its 50-day average, or on a "
+        f"**failed breakout**: a new high that gives back more than "
+        f"**{params['failed_breakout_giveback_pct']}%** within a few weeks."
+    )
+    st.markdown(
+        f"- A stage must hold for **{params['min_run_weeks']} consecutive week"
+        f"{'s' if params['min_run_weeks'] != 1 else ''}** before it's confirmed and "
+        f"annotated on the chart. This is what filters out noisy single-week wiggles — "
+        f"raise it for fewer, more confident transitions; lower it to catch changes earlier."
+    )
 
 
 st.title("NSE Market Data")
 
 symbols = get_symbols()
-tab_charts, tab_query = st.tabs(["Charts", "Query / Tables"])
 
-with tab_charts:
+# --- Sidebar: stage classifier settings, shared across Charts / Screener / Backtest ---
+with st.sidebar:
+    st.header(":material/tune: Stage classifier settings")
+    st.caption("Shared across the Charts, Stage screener, and Strategy backtest tabs.")
+
+    weekly_flat_pct = st.slider("30w MA flat threshold (%/week)", 0.05, 1.0, sc.DEFAULTS["weekly_flat_pct"], 0.05)
+    daily_flat_pct = st.slider("200d/50d MA flat threshold (%/day)", 0.01, 0.3, sc.DEFAULTS["daily_flat_pct"], 0.01)
+    whipsaw_band_pct = st.slider("Stage 1 whipsaw band (% of 30w MA)", 5.0, 25.0, sc.DEFAULTS["whipsaw_band_pct"], 1.0)
+    distribution_vol_mult = st.slider("Stage 3 distribution volume (x 50d avg)", 1.0, 3.0, sc.DEFAULTS["distribution_vol_mult"], 0.1)
+    breakout_vol_mult = st.slider("Stage 2 breakout volume (x 50d avg)", 1.5, 4.0, sc.DEFAULTS["breakout_vol_mult"], 0.1)
+    failed_breakout_giveback_pct = st.slider("Failed-breakout giveback (%)", 1.0, 10.0, sc.DEFAULTS["failed_breakout_giveback_pct"], 0.5)
+    min_run_weeks = st.slider("Min. weeks to confirm a stage", 1, 8, sc.DEFAULTS["min_run_weeks"], 1)
+
+    stage_params = {
+        **sc.DEFAULTS,
+        "weekly_flat_pct": weekly_flat_pct,
+        "daily_flat_pct": daily_flat_pct,
+        "whipsaw_band_pct": whipsaw_band_pct,
+        "distribution_vol_mult": distribution_vol_mult,
+        "breakout_vol_mult": breakout_vol_mult,
+        "failed_breakout_giveback_pct": failed_breakout_giveback_pct,
+        "min_run_weeks": min_run_weeks,
+    }
+
+    st.divider()
     if "show_help" not in st.session_state:
         st.session_state.show_help = False
+    if st.button(":material/help: What does this mean?", width="stretch"):
+        st.session_state.show_help = not st.session_state.show_help
+    if st.session_state.show_help:
+        with st.container(border=True):
+            render_stage_help(stage_params)
 
-    col1, col2, col3 = st.columns([1, 2, 1], vertical_alignment="bottom")
+tab_charts, tab_screener, tab_backtest, tab_query = st.tabs(
+    ["Charts", "Stage screener", "Strategy backtest", "Query / Tables"]
+)
+
+with tab_charts:
+    col1, col2 = st.columns([1, 3])
     with col1:
-        symbol = st.selectbox("Symbol", symbols, index=symbols.index("KIRLOSENG") if "KIRLOSENG" in symbols else 0)
+        symbol = st.selectbox("Symbol", symbols, key="symbol_select",
+                               index=symbols.index("KIRLOSENG") if "KIRLOSENG" in symbols else 0)
         interval = st.segmented_control("Interval", ["Daily", "Weekly"], default="Daily")
         show_stages = st.checkbox("Show stage annotations", value=True)
-    with col3:
-        if st.button(":material/help: Help", help="What do Stage 1-4 and these settings mean?"):
-            st.session_state.show_help = not st.session_state.show_help
+        st.caption("Moving average overlay")
+        overlay_choices = st.pills(
+            "Moving average overlay", ["30w MA", "200d MA", "50d MA", "30w band"],
+            selection_mode="multi", default=["30w MA"], label_visibility="collapsed",
+            help="30w band = the Stage 1 whipsaw threshold shaded around the 30w MA",
+        )
+        show_ma30w = "30w MA" in overlay_choices
+        show_ma200 = "200d MA" in overlay_choices
+        show_ma50 = "50d MA" in overlay_choices
+        show_band = "30w band" in overlay_choices
 
-    with st.expander(":material/tune: Stage classifier settings"):
-        e1, e2, e3 = st.columns(3)
-        weekly_flat_pct = e1.slider("30w MA flat threshold (%/week)", 0.05, 1.0, sc.DEFAULTS["weekly_flat_pct"], 0.05)
-        daily_flat_pct = e1.slider("200d/50d MA flat threshold (%/day)", 0.01, 0.3, sc.DEFAULTS["daily_flat_pct"], 0.01)
-        whipsaw_band_pct = e2.slider("Stage 1 whipsaw band (% of 30w MA)", 5.0, 25.0, sc.DEFAULTS["whipsaw_band_pct"], 1.0)
-        distribution_vol_mult = e2.slider("Stage 3 distribution volume (x 50d avg)", 1.0, 3.0, sc.DEFAULTS["distribution_vol_mult"], 0.1)
-        breakout_vol_mult = e3.slider("Stage 2 breakout volume (x 50d avg)", 1.5, 4.0, sc.DEFAULTS["breakout_vol_mult"], 0.1)
-        failed_breakout_giveback_pct = e3.slider("Failed-breakout giveback (%)", 1.0, 10.0, sc.DEFAULTS["failed_breakout_giveback_pct"], 0.5)
-        min_run_weeks = e3.slider("Min. weeks to confirm a stage", 1, 8, sc.DEFAULTS["min_run_weeks"], 1)
-        stage_params = {
-            **sc.DEFAULTS,
-            "weekly_flat_pct": weekly_flat_pct,
-            "daily_flat_pct": daily_flat_pct,
-            "whipsaw_band_pct": whipsaw_band_pct,
-            "distribution_vol_mult": distribution_vol_mult,
-            "breakout_vol_mult": breakout_vol_mult,
-            "failed_breakout_giveback_pct": failed_breakout_giveback_pct,
-            "min_run_weeks": min_run_weeks,
-        }
-
-    if st.session_state.show_help:
-        main_col, help_col = st.columns([2.3, 1], gap="medium")
+    df = get_prices(symbol)
+    if df.empty:
+        st.warning(f"No data for {symbol}")
     else:
-        main_col, help_col = st.container(), None
+        plot_df = df
+        if interval == "Weekly":
+            plot_df = (
+                df.set_index("date")
+                .resample("W-FRI")
+                .agg({"open": "first", "high": "max", "low": "min",
+                      "close": "last", "volume": "sum"})
+                .dropna()
+                .reset_index()
+            )
 
-    with main_col:
-        df = get_prices(symbol)
-        if df.empty:
-            st.warning(f"No data for {symbol}")
-        else:
-            df["date"] = pd.to_datetime(df["date"])
-            plot_df = df
-            if interval == "Weekly":
-                plot_df = (
-                    df.set_index("date")
-                    .resample("W-FRI")
-                    .agg({"open": "first", "high": "max", "low": "min",
-                          "close": "last", "volume": "sum"})
-                    .dropna()
-                    .reset_index()
+        min_d, max_d = plot_df["date"].min().date(), plot_df["date"].max().date()
+        date_range = st.slider("Date range", min_value=min_d, max_value=max_d,
+                                value=(min_d, max_d))
+        mask = (plot_df["date"].dt.date >= date_range[0]) & (plot_df["date"].dt.date <= date_range[1])
+        plot_df = plot_df[mask]
+
+        fig = make_subplots(
+            rows=2, cols=1, shared_xaxes=True,
+            row_heights=[0.75, 0.25], vertical_spacing=0.03,
+        )
+        fig.add_trace(go.Candlestick(
+            x=plot_df["date"], open=plot_df["open"], high=plot_df["high"],
+            low=plot_df["low"], close=plot_df["close"], name=symbol,
+        ), row=1, col=1)
+        fig.add_trace(go.Bar(
+            x=plot_df["date"], y=plot_df["volume"], name="Volume",
+            marker_color="rgba(100,100,100,0.4)",
+        ), row=2, col=1)
+
+        if show_ma30w or show_ma200 or show_ma50 or show_band:
+            overlay = sc.daily_overlay(df, stage_params)
+            overlay = overlay[(overlay["date"].dt.date >= date_range[0]) & (overlay["date"].dt.date <= date_range[1])]
+            if show_band:
+                fig.add_trace(go.Scatter(
+                    x=overlay["date"], y=overlay["ma30w_upper"], line=dict(width=0),
+                    showlegend=False, hoverinfo="skip",
+                ), row=1, col=1)
+                fig.add_trace(go.Scatter(
+                    x=overlay["date"], y=overlay["ma30w_lower"], line=dict(width=0),
+                    fill="tonexty", fillcolor="rgba(158,158,158,0.15)",
+                    name="30w band", hoverinfo="skip",
+                ), row=1, col=1)
+            if show_ma30w:
+                fig.add_trace(go.Scatter(
+                    x=overlay["date"], y=overlay["ma30w"], line=dict(color="#9e9e9e", width=1.5),
+                    name="30w MA",
+                ), row=1, col=1)
+            if show_ma200:
+                fig.add_trace(go.Scatter(
+                    x=overlay["date"], y=overlay["ma200"], line=dict(color="#42a5f5", width=1.2),
+                    name="200d MA",
+                ), row=1, col=1)
+            if show_ma50:
+                fig.add_trace(go.Scatter(
+                    x=overlay["date"], y=overlay["ma50"], line=dict(color="#ab47bc", width=1.2),
+                    name="50d MA",
+                ), row=1, col=1)
+
+        transitions = get_stage_transitions(symbol, stage_params)
+        if show_stages and not transitions.empty:
+            visible = transitions[
+                (transitions["date"].dt.date >= date_range[0]) & (transitions["date"].dt.date <= date_range[1])
+            ]
+            for _, t in visible.iterrows():
+                color = sc.STAGE_COLORS[t["stage"]]
+                fig.add_vline(
+                    x=t["date"], line_width=1, line_dash="dash", line_color=color, row=1, col=1,
+                )
+                fig.add_annotation(
+                    x=t["date"], y=1, yref="y domain", yanchor="bottom", row=1, col=1,
+                    text=f"S{t['stage']}", showarrow=False, font=dict(color=color, size=11),
                 )
 
-            min_d, max_d = plot_df["date"].min().date(), plot_df["date"].max().date()
-            date_range = st.slider("Date range", min_value=min_d, max_value=max_d,
-                                    value=(min_d, max_d))
-            mask = (plot_df["date"].dt.date >= date_range[0]) & (plot_df["date"].dt.date <= date_range[1])
-            plot_df = plot_df[mask]
+        fig.update_layout(
+            height=650, xaxis_rangeslider_visible=False,
+            title=f"{symbol} — {interval}",
+            margin=dict(t=40, b=20),
+        )
+        st.plotly_chart(fig, width="stretch")
 
-            fig = make_subplots(
-                rows=2, cols=1, shared_xaxes=True,
-                row_heights=[0.75, 0.25], vertical_spacing=0.03,
+        latest = plot_df.iloc[-1]
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Last Close", f"{latest['close']:.2f}")
+        m2.metric("Period High", f"{plot_df['high'].max():.2f}")
+        m3.metric("Period Low", f"{plot_df['low'].min():.2f}")
+        pct_change = (plot_df["close"].iloc[-1] / plot_df["close"].iloc[0] - 1) * 100
+        m4.metric("Period Change", f"{pct_change:+.1f}%")
+
+        if show_stages:
+            st.subheader("Stage transitions")
+            if transitions.empty:
+                st.caption("Not enough history yet to classify stages for this symbol.")
+            else:
+                display_transitions = transitions.sort_values("date", ascending=False).copy()
+                display_transitions["date"] = display_transitions["date"].dt.date
+                st.dataframe(
+                    display_transitions[["date", "stage_name", "close"]]
+                    .rename(columns={"stage_name": "stage", "close": "close at transition"}),
+                    width="stretch", height=250,
+                )
+
+with tab_screener:
+    st.caption(
+        "Find stocks that entered a given stage within a date window, using the classifier "
+        "settings in the sidebar. First scan takes ~a minute across the full universe; "
+        "cached after that until you change the settings."
+    )
+    s1, s2, s3 = st.columns([1.2, 1, 1])
+    with s1:
+        stage_filter = st.multiselect(
+            "Stage(s)", [1, 2, 3, 4], default=[2],
+            format_func=lambda s: sc.STAGE_NAMES[s],
+        )
+    with s2:
+        screen_start = st.date_input("From", value=pd.Timestamp.today() - pd.Timedelta(days=180))
+    with s3:
+        screen_end = st.date_input("To", value=pd.Timestamp.today())
+
+    if st.button(":material/search: Scan universe", type="primary"):
+        st.session_state["screener_transitions"] = get_universe_transitions(stage_params)
+
+    if "screener_transitions" in st.session_state:
+        universe_transitions = st.session_state["screener_transitions"]
+        results = universe_transitions[
+            universe_transitions["stage"].isin(stage_filter) &
+            (universe_transitions["date"].dt.date >= screen_start) &
+            (universe_transitions["date"].dt.date <= screen_end)
+        ].sort_values("date", ascending=False).copy()
+
+        st.write(f"**{len(results)} matches**")
+        if results.empty:
+            st.caption("No stocks entered the selected stage(s) in this window.")
+        else:
+            results["days_since"] = (pd.Timestamp.today().normalize() - results["date"]).dt.days
+            results["date"] = results["date"].dt.date
+            st.dataframe(
+                results[["symbol", "stage_name", "date", "close", "days_since", "ma30w_slope_pct"]]
+                .rename(columns={"stage_name": "stage", "close": "close at transition",
+                                  "ma30w_slope_pct": "30w slope %/wk"}),
+                width="stretch", height=450,
             )
-            fig.add_trace(go.Candlestick(
-                x=plot_df["date"], open=plot_df["open"], high=plot_df["high"],
-                low=plot_df["low"], close=plot_df["close"], name=symbol,
-            ), row=1, col=1)
-            fig.add_trace(go.Bar(
-                x=plot_df["date"], y=plot_df["volume"], name="Volume",
-                marker_color="rgba(100,100,100,0.4)",
-            ), row=2, col=1)
+            st.caption("Pick any symbol above in the Charts tab's symbol dropdown to see its chart.")
+    else:
+        st.info("Click **Scan universe** to run the screen.")
 
-            transitions = get_stage_transitions(symbol, stage_params)
-            if show_stages and not transitions.empty:
-                visible = transitions[
-                    (transitions["date"].dt.date >= date_range[0]) & (transitions["date"].dt.date <= date_range[1])
-                ]
-                for _, t in visible.iterrows():
-                    color = sc.STAGE_COLORS[t["stage"]]
-                    fig.add_vline(
-                        x=t["date"], line_width=1, line_dash="dash", line_color=color, row=1, col=1,
-                    )
-                    fig.add_annotation(
-                        x=t["date"], y=1, yref="y domain", yanchor="bottom", row=1, col=1,
-                        text=f"S{t['stage']}", showarrow=False, font=dict(color=color, size=11),
-                    )
+with tab_backtest:
+    st.caption(
+        "Simulate: buy N days after a Stage 2 confirmation, sell at the earliest of a stop-loss "
+        "or N days after the first Stage 3/4 confirmation after entry. Uses the same universe "
+        "and stage settings as the screener."
+    )
+    st.info(
+        ":material/info: Runs across the full ~1149-stock market-cap>₹2000cr universe. "
+        "Filtering the universe by market cap / ROCE / sales growth before backtesting isn't "
+        "wired in yet — that needs a fundamentals data source beyond what Kite provides.",
+        icon=":material/info:",
+    )
 
-            fig.update_layout(
-                height=650, xaxis_rangeslider_visible=False,
-                title=f"{symbol} — {interval}",
-                margin=dict(t=40, b=20),
+    with st.form("backtest_form"):
+        b1, b2, b3 = st.columns(3)
+        with b1:
+            bt_start = st.date_input("Start date", value=pd.Timestamp.today() - pd.Timedelta(days=3 * 365))
+            bt_end = st.date_input("End date", value=pd.Timestamp.today())
+            total_capital = st.number_input("Total starting capital (₹)", min_value=10_000.0,
+                                             value=bt.DEFAULTS["total_capital"], step=50_000.0)
+        with b2:
+            entry_delay_days = st.slider("Days after Stage 2 to enter", 0, 20, bt.DEFAULTS["entry_delay_days"])
+            exit_delay_days = st.slider("Days after Stage 3/4 to exit", 0, 20, bt.DEFAULTS["exit_delay_days"])
+            stop_loss_pct = st.slider("Stop loss (%)", 1.0, 20.0, bt.DEFAULTS["stop_loss_pct"], 0.5)
+        with b3:
+            participation_pct = st.slider("% of signals taken (top by momentum)", 5, 100,
+                                           int(bt.DEFAULTS["participation_pct"]), 5)
+            position_size = st.number_input("Position size per trade (₹)", min_value=1_000.0,
+                                             value=bt.DEFAULTS["position_size"], step=5_000.0)
+            enable_rotation = st.checkbox("Rotate out of the worst loser when capital is full",
+                                           value=bt.DEFAULTS["enable_rotation"])
+
+        run_backtest = st.form_submit_button(":material/play_arrow: Run backtest", type="primary")
+
+    if run_backtest:
+        backtest_params = {
+            "start_date": pd.Timestamp(bt_start), "end_date": pd.Timestamp(bt_end),
+            "entry_delay_days": entry_delay_days, "exit_delay_days": exit_delay_days,
+            "stop_loss_pct": stop_loss_pct, "participation_pct": participation_pct,
+            "position_size": position_size, "total_capital": total_capital,
+            "enable_rotation": enable_rotation,
+        }
+        transitions = get_universe_transitions(stage_params)
+        with st.spinner("Running simulation..."):
+            frames = get_price_frames()
+            result = bt.run_backtest(frames, transitions, backtest_params)
+        st.session_state["backtest_result"] = result
+
+    if "backtest_result" in st.session_state:
+        result = st.session_state["backtest_result"]
+        metrics = result["metrics"]
+
+        k1, k2, k3, k4, k5 = st.columns(5)
+        k1.metric("Total return", f"{metrics['total_return_pct']:+.1f}%")
+        k2.metric("CAGR", f"{metrics['cagr_pct']:+.1f}%")
+        k3.metric("Max drawdown", f"{metrics['max_drawdown_pct']:.1f}%")
+        k4.metric("Win rate", f"{metrics['win_rate_pct']:.0f}%")
+        k5.metric("Trades", f"{metrics['num_trades']}")
+
+        if not result["equity_curve"].empty:
+            st.line_chart(result["equity_curve"].set_index("date")["value"], height=350)
+
+        st.subheader("Trade log")
+        if result["trades"].empty:
+            st.caption("No trades were taken with these settings.")
+        else:
+            trades = result["trades"].sort_values("entry_date", ascending=False)
+            st.dataframe(trades, width="stretch", height=350)
+            st.download_button(
+                "Download trade log as CSV", trades.to_csv(index=False),
+                file_name="backtest_trades.csv", mime="text/csv",
             )
-            st.plotly_chart(fig, width="stretch")
 
-            latest = plot_df.iloc[-1]
-            m1, m2, m3, m4 = st.columns(4)
-            m1.metric("Last Close", f"{latest['close']:.2f}")
-            m2.metric("Period High", f"{plot_df['high'].max():.2f}")
-            m3.metric("Period Low", f"{plot_df['low'].min():.2f}")
-            pct_change = (plot_df["close"].iloc[-1] / plot_df["close"].iloc[0] - 1) * 100
-            m4.metric("Period Change", f"{pct_change:+.1f}%")
-
-            if show_stages:
-                st.subheader("Stage transitions")
-                if transitions.empty:
-                    st.caption("Not enough history yet to classify stages for this symbol.")
-                else:
-                    display_transitions = transitions.sort_values("date", ascending=False).copy()
-                    display_transitions["date"] = display_transitions["date"].dt.date
-                    st.dataframe(
-                        display_transitions[["date", "stage_name", "close"]]
-                        .rename(columns={"stage_name": "stage", "close": "close at transition"}),
-                        width="stretch", height=250,
-                    )
-
-    if help_col is not None:
-        with help_col:
-            render_stage_help(stage_params)
+        if not result["missed_signals"].empty:
+            with st.expander(f":material/report: {len(result['missed_signals'])} signals skipped (no free capital)"):
+                st.dataframe(result["missed_signals"], width="stretch", height=200)
+    else:
+        st.info("Set your strategy parameters above and click **Run backtest**.")
 
 with tab_query:
     st.subheader("Tables")
@@ -256,8 +443,8 @@ with tab_query:
     st.subheader("Custom SQL")
     default_query = "SELECT tradingsymbol, count(*) AS rows, min(date) AS start, max(date) AS end\nFROM daily_prices\nGROUP BY tradingsymbol\nORDER BY rows DESC\nLIMIT 20"
     query = st.text_area("Query", value=default_query, height=140)
-    run = st.button("Run query")
-    if run:
+    run_query = st.button("Run query")
+    if run_query:
         try:
             result_df = con.execute(query).df()
             st.success(f"{len(result_df)} rows returned")
