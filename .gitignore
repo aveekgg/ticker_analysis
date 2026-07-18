@@ -1,0 +1,13 @@
+# Deny by default -- this repo is scoped to just the Streamlit app.
+# Only the files explicitly allow-listed below get committed.
+*
+
+!.gitignore
+!.gitattributes
+!requirements.txt
+!README.md
+!market_data_app.py
+!stage_classifier.py
+!nse_market_data.duckdb
+!.streamlit/
+!.streamlit/**
