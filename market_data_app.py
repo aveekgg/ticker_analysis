@@ -72,6 +72,40 @@ def get_stage_transitions(symbol: str, params: dict) -> pd.DataFrame:
     return sc.get_transitions(classified)
 
 
+@st.cache_data
+def get_sector_map() -> pd.DataFrame:
+    con = get_connection()
+    return con.execute(
+        "SELECT tradingsymbol AS symbol, macro_sector, sector, industry, basic_industry "
+        "FROM instruments WHERE macro_sector IS NOT NULL"
+    ).df()
+
+
+def render_sector_filters(key_prefix: str) -> set:
+    """Cascading Macro Sector -> Sector -> Industry -> Basic Industry filters.
+    Returns the set of matching symbols, or None if nothing is selected
+    (meaning "no sector filter, include everything")."""
+    sector_map = get_sector_map()
+    with st.expander(":material/filter_alt: Filter by sector / industry"):
+        c1, c2, c3, c4 = st.columns(4)
+        macro_sel = c1.multiselect("Macro sector", sorted(sector_map["macro_sector"].unique()), key=f"{key_prefix}_macro")
+        scoped = sector_map[sector_map["macro_sector"].isin(macro_sel)] if macro_sel else sector_map
+
+        sector_sel = c2.multiselect("Sector", sorted(scoped["sector"].unique()), key=f"{key_prefix}_sector")
+        scoped = scoped[scoped["sector"].isin(sector_sel)] if sector_sel else scoped
+
+        industry_sel = c3.multiselect("Industry", sorted(scoped["industry"].unique()), key=f"{key_prefix}_industry")
+        scoped = scoped[scoped["industry"].isin(industry_sel)] if industry_sel else scoped
+
+        basic_sel = c4.multiselect("Basic industry", sorted(scoped["basic_industry"].unique()), key=f"{key_prefix}_basic")
+        scoped = scoped[scoped["basic_industry"].isin(basic_sel)] if basic_sel else scoped
+
+        any_filter = bool(macro_sel or sector_sel or industry_sel or basic_sel)
+        if any_filter:
+            st.caption(f"{len(scoped)} symbols match this sector filter.")
+        return set(scoped["symbol"]) if any_filter else None
+
+
 @st.cache_data(show_spinner="Scanning the full universe for stage transitions (can take ~a minute the first time)...")
 def get_universe_transitions(params: dict) -> pd.DataFrame:
     frames = get_price_frames()
@@ -315,6 +349,8 @@ with tab_screener:
     with s3:
         screen_end = st.date_input("To", value=pd.Timestamp.today())
 
+    screener_sector_symbols = render_sector_filters("screener")
+
     if st.button(":material/search: Scan universe", type="primary"):
         st.session_state["screener_transitions"] = get_universe_transitions(stage_params)
 
@@ -325,15 +361,19 @@ with tab_screener:
             (universe_transitions["date"].dt.date >= screen_start) &
             (universe_transitions["date"].dt.date <= screen_end)
         ].sort_values("date", ascending=False).copy()
+        if screener_sector_symbols is not None:
+            results = results[results["symbol"].isin(screener_sector_symbols)]
 
         st.write(f"**{len(results)} matches**")
         if results.empty:
             st.caption("No stocks entered the selected stage(s) in this window.")
         else:
+            results = results.merge(get_sector_map(), on="symbol", how="left")
             results["days_since"] = (pd.Timestamp.today().normalize() - results["date"]).dt.days
             results["date"] = results["date"].dt.date
             st.dataframe(
-                results[["symbol", "stage_name", "date", "close", "days_since", "ma30w_slope_pct"]]
+                results[["symbol", "stage_name", "date", "close", "days_since", "ma30w_slope_pct",
+                          "sector", "basic_industry"]]
                 .rename(columns={"stage_name": "stage", "close": "close at transition",
                                   "ma30w_slope_pct": "30w slope %/wk"}),
                 width="stretch", height=450,
@@ -349,11 +389,13 @@ with tab_backtest:
         "and stage settings as the screener."
     )
     st.info(
-        ":material/info: Runs across the full ~1149-stock market-cap>₹2000cr universe. "
-        "Filtering the universe by market cap / ROCE / sales growth before backtesting isn't "
-        "wired in yet — that needs a fundamentals data source beyond what Kite provides.",
+        ":material/info: Runs across the full ~1149-stock market-cap>₹2000cr universe by default. "
+        "Filtering by market cap / ROCE / sales growth isn't wired in yet — that needs a "
+        "fundamentals data source beyond what Kite provides — but sector/industry filtering below works.",
         icon=":material/info:",
     )
+
+    backtest_sector_symbols = render_sector_filters("backtest")
 
     with st.form("backtest_form"):
         b1, b2, b3 = st.columns(3)
@@ -387,6 +429,9 @@ with tab_backtest:
         transitions = get_universe_transitions(stage_params)
         with st.spinner("Running simulation..."):
             frames = get_price_frames()
+            if backtest_sector_symbols is not None:
+                transitions = transitions[transitions["symbol"].isin(backtest_sector_symbols)]
+                frames = {sym: df for sym, df in frames.items() if sym in backtest_sector_symbols}
             result = bt.run_backtest(frames, transitions, backtest_params)
         st.session_state["backtest_result"] = result
 
