@@ -66,19 +66,38 @@ def get_price_frames() -> dict:
 
 
 @st.cache_data
-def get_stage_transitions(symbol: str, params: dict) -> pd.DataFrame:
-    daily = get_prices(symbol)
-    classified = sc.classify(daily, params)
-    return sc.get_transitions(classified)
-
-
-@st.cache_data
 def get_sector_map() -> pd.DataFrame:
     con = get_connection()
     return con.execute(
         "SELECT tradingsymbol AS symbol, macro_sector, sector, industry, basic_industry "
         "FROM instruments WHERE macro_sector IS NOT NULL"
     ).df()
+
+
+@st.cache_data
+def get_group_classified_for_symbol(symbol: str, group_level: str, params: dict) -> pd.DataFrame:
+    """The classified peer-group index for one symbol's group -- used so the
+    Charts tab's single-symbol view can apply the same group-strength/RS
+    checks without loading the full 1149-symbol universe."""
+    sector_map = get_sector_map()
+    row = sector_map[sector_map["symbol"] == symbol]
+    if row.empty:
+        return pd.DataFrame()
+    group_name = row.iloc[0][group_level]
+    members = sector_map[sector_map[group_level] == group_name]["symbol"].tolist()
+    member_frames = {m: get_prices(m) for m in members}
+    member_frames = {m: df for m, df in member_frames.items() if not df.empty}
+    return sc.classify_group(member_frames, {**params, "group_level": group_level})
+
+
+@st.cache_data
+def get_stage_transitions(symbol: str, params: dict) -> pd.DataFrame:
+    daily = get_prices(symbol)
+    group_classified = None
+    if params["require_group_strength"] or params["require_rs_rising"]:
+        group_classified = get_group_classified_for_symbol(symbol, params["group_level"], params)
+    classified = sc.classify(daily, params, group_classified=group_classified)
+    return sc.get_transitions(classified)
 
 
 def render_sector_filters(key_prefix: str) -> set:
@@ -106,10 +125,11 @@ def render_sector_filters(key_prefix: str) -> set:
         return set(scoped["symbol"]) if any_filter else None
 
 
-@st.cache_data(show_spinner="Scanning the full universe for stage transitions (can take ~a minute the first time)...")
+@st.cache_data(show_spinner="Scanning the full universe for stage transitions (can take a couple minutes the first time)...")
 def get_universe_transitions(params: dict) -> pd.DataFrame:
     frames = get_price_frames()
-    return sc.scan_universe(frames, params)
+    sector_map = get_sector_map() if (params["require_group_strength"] or params["require_rs_rising"]) else None
+    return sc.scan_universe(frames, params, sector_map=sector_map)
 
 
 def render_stage_help(params: dict):
@@ -166,6 +186,36 @@ def render_stage_help(params: dict):
         f"raise it for fewer, more confident transitions; lower it to catch changes earlier."
     )
 
+    st.divider()
+    st.markdown("#### :material/groups: Why sector/peer group matters")
+    st.markdown(
+        "Weinstein didn't just look at a stock in isolation — he checked its **industry "
+        "group** first. A breakout is much more trustworthy when the stock's peers are "
+        "also doing well, and when the stock is outperforming those peers, not just "
+        "riding the same wave as everyone else."
+    )
+    group_label = params["group_level"].replace("_", " ")
+    st.markdown(
+        f"- Peer group is currently defined at the **{group_label}** level "
+        f"(a synthetic index built by averaging every stock in that group)."
+    )
+    if params["require_group_strength"]:
+        st.markdown(
+            "- **Require peer group to be in Stage 1/2** is ON: a stock's Stage 2 won't "
+            "confirm if its own peer group is topping (Stage 3) or declining (Stage 4) — "
+            "don't buy strength in a sinking group."
+        )
+    else:
+        st.markdown("- **Require peer group to be in Stage 1/2** is OFF: group weakness is ignored.")
+    if params["require_rs_rising"]:
+        st.markdown(
+            "- **Require rising strength vs. peer group** is ON: a stock's Stage 2 won't "
+            "confirm unless it's *outperforming* its group (a rising relative-strength line), "
+            "not just moving up with it."
+        )
+    else:
+        st.markdown("- **Require rising strength vs. peer group** is OFF: relative strength is ignored.")
+
 
 st.title("NSE Market Data")
 
@@ -184,6 +234,22 @@ with st.sidebar:
     failed_breakout_giveback_pct = st.slider("Failed-breakout giveback (%)", 1.0, 10.0, sc.DEFAULTS["failed_breakout_giveback_pct"], 0.5)
     min_run_weeks = st.slider("Min. weeks to confirm a stage", 1, 8, sc.DEFAULTS["min_run_weeks"], 1)
 
+    st.divider()
+    st.caption(":material/groups: Group / relative-strength confirmation (Weinstein's group analysis)")
+    group_level = st.selectbox(
+        "Peer group defined by", ["macro_sector", "sector", "industry", "basic_industry"],
+        index=["macro_sector", "sector", "industry", "basic_industry"].index(sc.DEFAULTS["group_level"]),
+        format_func=lambda s: s.replace("_", " ").title(),
+    )
+    require_group_strength = st.checkbox(
+        "Require peer group to be in Stage 1/2", value=sc.DEFAULTS["require_group_strength"],
+        help="A stock's Stage 2 only confirms if its peer group isn't itself topping or declining.",
+    )
+    require_rs_rising = st.checkbox(
+        "Require rising strength vs. peer group", value=sc.DEFAULTS["require_rs_rising"],
+        help="A stock's Stage 2 only confirms if it's outperforming its peer group, not just moving with it.",
+    )
+
     stage_params = {
         **sc.DEFAULTS,
         "weekly_flat_pct": weekly_flat_pct,
@@ -193,6 +259,9 @@ with st.sidebar:
         "breakout_vol_mult": breakout_vol_mult,
         "failed_breakout_giveback_pct": failed_breakout_giveback_pct,
         "min_run_weeks": min_run_weeks,
+        "group_level": group_level,
+        "require_group_strength": require_group_strength,
+        "require_rs_rising": require_rs_rising,
     }
 
     st.divider()
