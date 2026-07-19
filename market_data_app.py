@@ -1,17 +1,19 @@
 """
 Local UI for querying nse_market_data.duckdb, viewing price charts, screening
-stocks by Weinstein stage, and backtesting a Stage-2/3/4 trading strategy.
+stocks by Weinstein stage, and backtesting two independent trading systems.
 
 Run:
     streamlit run market_data_app.py
 
 Tabs:
-    Charts          - candlestick + volume + MA overlay for one symbol, with
-                       stage annotations
-    Stage screener  - which stocks entered a given stage in a date window
-    Strategy backtest - simulate the Stage-2 entry / Stage-3-4-or-stop-loss
-                       exit strategy across the full universe
-    Query / Tables  - run arbitrary SQL against the DuckDB file
+    Charts             - candlestick + volume + MA overlay for one symbol,
+                          with stage annotations and score-engine buy/sell markers
+    Stage screener     - which stocks entered a given stage in a date window
+    Strategy backtest  - simulate the Stage-2 entry / Stage-3-4-or-stop-loss
+                          exit strategy across the full universe
+    Signal backtest    - simulate the OHLCV-scoring entry / stop-trailing-
+                          stop-max-holding exit strategy across the universe
+    Query / Tables     - run arbitrary SQL against the DuckDB file
 """
 
 import duckdb
@@ -21,6 +23,7 @@ from plotly.subplots import make_subplots
 import streamlit as st
 
 import backtester as bt
+import signal_engine as se
 import stage_classifier as sc
 
 DB_FILE = "nse_market_data.duckdb"
@@ -130,6 +133,28 @@ def get_universe_transitions(params: dict) -> pd.DataFrame:
     frames = get_price_frames()
     sector_map = get_sector_map() if (params["require_group_strength"] or params["require_rs_rising"]) else None
     return sc.scan_universe(frames, params, sector_map=sector_map)
+
+
+@st.cache_resource(show_spinner="Building the broad-market benchmark index (first time only)...")
+def get_market_benchmark() -> pd.Series:
+    frames = get_price_frames()
+    return se.build_market_index(frames)
+
+
+@st.cache_data
+def get_symbol_score_trades(symbol: str, params: dict) -> pd.DataFrame:
+    """Single-symbol score-engine buy/sell pairs, for the Charts tab overlay
+    -- runs the same backtest mechanics scoped to just this one stock."""
+    daily = get_prices(symbol)
+    if daily.empty:
+        return pd.DataFrame()
+    benchmark = get_market_benchmark()
+    full_params = {
+        **params, "start_date": daily["date"].min(), "end_date": daily["date"].max(),
+        "position_size": params["total_capital"],  # single symbol -- always fully sized
+    }
+    result = se.run_score_backtest({symbol: daily}, full_params, benchmark_close=benchmark)
+    return result["trades"]
 
 
 def render_stage_help(params: dict):
@@ -266,6 +291,36 @@ with st.sidebar:
     }
 
     st.divider()
+    st.header(":material/query_stats: Signal score settings")
+    st.caption("A second, independent buy/sell system: a 0-100 OHLCV-derived score instead of Weinstein stages.")
+    with st.expander("Factor weights", expanded=False):
+        weight_return = st.slider("1-month return", 0.0, 40.0, se.DEFAULTS["weight_return"], 1.0)
+        weight_ema_alignment = st.slider("EMA alignment", 0.0, 40.0, se.DEFAULTS["weight_ema_alignment"], 1.0)
+        weight_volume_dryup = st.slider("Volume dry-up", 0.0, 40.0, se.DEFAULTS["weight_volume_dryup"], 1.0)
+        weight_atr_compression = st.slider("ATR compression", 0.0, 40.0, se.DEFAULTS["weight_atr_compression"], 1.0)
+        weight_near_high = st.slider("Near high", 0.0, 40.0, se.DEFAULTS["weight_near_high"], 1.0)
+        weight_relative_strength = st.slider("Relative strength vs. market", 0.0, 40.0, se.DEFAULTS["weight_relative_strength"], 1.0)
+        total_weight = (weight_return + weight_ema_alignment + weight_volume_dryup +
+                         weight_atr_compression + weight_near_high + weight_relative_strength)
+        st.caption(f"Max possible score: {total_weight:.0f}")
+
+    buy_score_threshold = st.slider("Buy score threshold", 20.0, min(100.0, total_weight) if total_weight else 100.0,
+                                     min(se.DEFAULTS["buy_score_threshold"], total_weight) if total_weight else 60.0, 1.0)
+    with st.expander("Exit rules", expanded=False):
+        se_stop_loss_pct = st.slider("Stop loss (%)", 1.0, 20.0, se.DEFAULTS["stop_loss_pct"], 0.5, key="se_sl")
+        trailing_stop_pct = st.slider("Trailing stop (%)", 1.0, 30.0, se.DEFAULTS["trailing_stop_pct"], 0.5)
+        max_holding_days = st.slider("Max holding period (days)", 5, 180, se.DEFAULTS["max_holding_days"], 5)
+
+    score_params = {
+        **se.DEFAULTS,
+        "weight_return": weight_return, "weight_ema_alignment": weight_ema_alignment,
+        "weight_volume_dryup": weight_volume_dryup, "weight_atr_compression": weight_atr_compression,
+        "weight_near_high": weight_near_high, "weight_relative_strength": weight_relative_strength,
+        "buy_score_threshold": buy_score_threshold, "stop_loss_pct": se_stop_loss_pct,
+        "trailing_stop_pct": trailing_stop_pct, "max_holding_days": max_holding_days,
+    }
+
+    st.divider()
     if "show_help" not in st.session_state:
         st.session_state.show_help = False
     if st.button(":material/help: What does this mean?", width="stretch"):
@@ -274,8 +329,8 @@ with st.sidebar:
         with st.container(border=True):
             render_stage_help(stage_params)
 
-tab_charts, tab_screener, tab_backtest, tab_query = st.tabs(
-    ["Charts", "Stage screener", "Strategy backtest", "Query / Tables"]
+tab_charts, tab_screener, tab_backtest, tab_signal_backtest, tab_query = st.tabs(
+    ["Charts", "Stage screener", "Strategy backtest", "Signal backtest", "Query / Tables"]
 )
 
 with tab_charts:
@@ -285,6 +340,7 @@ with tab_charts:
                                index=symbols.index("KIRLOSENG") if "KIRLOSENG" in symbols else 0)
         interval = st.segmented_control("Interval", ["Daily", "Weekly"], default="Daily")
         show_stages = st.checkbox("Show stage annotations", value=True)
+        show_score_signals = st.checkbox("Show score-engine buy/sell markers", value=False)
         st.caption("Moving average overlay")
         overlay_choices = st.pills(
             "Moving average overlay", ["30w MA", "200d MA", "50d MA", "30w band"],
@@ -374,6 +430,25 @@ with tab_charts:
                     text=f"S{t['stage']}", showarrow=False, font=dict(color=color, size=11),
                 )
 
+        score_trades = pd.DataFrame()
+        if show_score_signals:
+            score_trades = get_symbol_score_trades(symbol, score_params)
+            if not score_trades.empty:
+                visible_trades = score_trades[
+                    (score_trades["entry_date"].dt.date >= date_range[0]) & (score_trades["entry_date"].dt.date <= date_range[1])
+                ]
+                fig.add_trace(go.Scatter(
+                    x=visible_trades["entry_date"], y=visible_trades["entry_price"],
+                    mode="markers", name="Score buy",
+                    marker=dict(symbol="triangle-up", size=11, color="#2ecc71", line=dict(width=1, color="white")),
+                ), row=1, col=1)
+                fig.add_trace(go.Scatter(
+                    x=visible_trades["exit_date"], y=visible_trades["exit_price"],
+                    mode="markers", name="Score sell",
+                    marker=dict(symbol="triangle-down", size=11, color="#e74c3c", line=dict(width=1, color="white")),
+                    text=visible_trades["exit_reason"], hovertemplate="%{text}<br>%{y:.2f}<extra></extra>",
+                ), row=1, col=1)
+
         fig.update_layout(
             height=650, xaxis_rangeslider_visible=False,
             title=f"{symbol} — {interval}",
@@ -399,6 +474,19 @@ with tab_charts:
                 st.dataframe(
                     display_transitions[["date", "stage_name", "close"]]
                     .rename(columns={"stage_name": "stage", "close": "close at transition"}),
+                    width="stretch", height=250,
+                )
+
+        if show_score_signals:
+            st.subheader("Score-engine trades")
+            if score_trades.empty:
+                st.caption("No score-engine buy signals fired for this symbol at the current threshold.")
+            else:
+                display_trades = score_trades.sort_values("entry_date", ascending=False).copy()
+                display_trades["entry_date"] = display_trades["entry_date"].dt.date
+                display_trades["exit_date"] = display_trades["exit_date"].dt.date
+                st.dataframe(
+                    display_trades[["entry_date", "entry_price", "exit_date", "exit_price", "exit_reason", "pnl_pct"]],
                     width="stretch", height=250,
                 )
 
@@ -533,6 +621,81 @@ with tab_backtest:
         if not result["missed_signals"].empty:
             with st.expander(f":material/report: {len(result['missed_signals'])} signals skipped (no free capital)"):
                 st.dataframe(result["missed_signals"], width="stretch", height=200)
+    else:
+        st.info("Set your strategy parameters above and click **Run backtest**.")
+
+with tab_signal_backtest:
+    st.caption(
+        "A second, independent system: buy when the OHLCV-derived score crosses above the "
+        "threshold (see sidebar), sell at the earliest of a stop-loss, a trailing stop, or the "
+        "max holding period. No Weinstein stages involved -- pure price/volume scoring."
+    )
+    st.info(
+        f":material/info: Score built from: 1-month return, EMA alignment, volume dry-up, "
+        f"ATR compression, proximity to highs, and relative strength vs. a broad-market benchmark "
+        f"(an equal-weighted index of the full universe). Current max score: "
+        f"{sum(score_params[k] for k in ['weight_return','weight_ema_alignment','weight_volume_dryup','weight_atr_compression','weight_near_high','weight_relative_strength']):.0f}.",
+        icon=":material/info:",
+    )
+
+    signal_sector_symbols = render_sector_filters("signal_backtest")
+
+    with st.form("signal_backtest_form"):
+        sb1, sb2 = st.columns(2)
+        with sb1:
+            sig_start = st.date_input("Start date", value=pd.Timestamp.today() - pd.Timedelta(days=3 * 365), key="sig_start")
+            sig_end = st.date_input("End date", value=pd.Timestamp.today(), key="sig_end")
+            sig_total_capital = st.number_input("Total starting capital (₹)", min_value=10_000.0,
+                                                 value=se.DEFAULTS["total_capital"], step=50_000.0, key="sig_capital")
+        with sb2:
+            sig_position_size = st.number_input("Position size per trade (₹)", min_value=1_000.0,
+                                                 value=se.DEFAULTS["position_size"], step=5_000.0, key="sig_position")
+            sig_participation_pct = st.slider("% of signals taken (top by score)", 5, 100,
+                                               int(se.DEFAULTS["participation_pct"]), 5, key="sig_participation")
+            sig_enable_rotation = st.checkbox("Rotate out of the worst loser when capital is full",
+                                               value=se.DEFAULTS["enable_rotation"], key="sig_rotation")
+
+        run_signal_backtest = st.form_submit_button(":material/play_arrow: Run backtest", type="primary")
+
+    if run_signal_backtest:
+        signal_backtest_params = {
+            **score_params,
+            "start_date": pd.Timestamp(sig_start), "end_date": pd.Timestamp(sig_end),
+            "total_capital": sig_total_capital, "position_size": sig_position_size,
+            "participation_pct": sig_participation_pct, "enable_rotation": sig_enable_rotation,
+        }
+        with st.spinner("Running simulation (scoring the full universe day by day)..."):
+            frames = get_price_frames()
+            if signal_sector_symbols is not None:
+                frames = {sym: df for sym, df in frames.items() if sym in signal_sector_symbols}
+            benchmark = get_market_benchmark()
+            result = se.run_score_backtest(frames, signal_backtest_params, benchmark_close=benchmark)
+        st.session_state["signal_backtest_result"] = result
+
+    if "signal_backtest_result" in st.session_state:
+        result = st.session_state["signal_backtest_result"]
+        metrics = result["metrics"]
+
+        k1, k2, k3, k4, k5 = st.columns(5)
+        k1.metric("Total return", f"{metrics['total_return_pct']:+.1f}%")
+        k2.metric("CAGR", f"{metrics['cagr_pct']:+.1f}%")
+        k3.metric("Max drawdown", f"{metrics['max_drawdown_pct']:.1f}%")
+        k4.metric("Win rate", f"{metrics['win_rate_pct']:.0f}%")
+        k5.metric("Trades", f"{metrics['num_trades']}")
+
+        if not result["equity_curve"].empty:
+            st.line_chart(result["equity_curve"].set_index("date")["value"], height=350)
+
+        st.subheader("Trade log")
+        if result["trades"].empty:
+            st.caption("No trades were taken with these settings.")
+        else:
+            trades = result["trades"].sort_values("entry_date", ascending=False)
+            st.dataframe(trades, width="stretch", height=350)
+            st.download_button(
+                "Download trade log as CSV", trades.to_csv(index=False),
+                file_name="signal_backtest_trades.csv", mime="text/csv",
+            )
     else:
         st.info("Set your strategy parameters above and click **Run backtest**.")
 
