@@ -33,13 +33,17 @@ GROUP / RELATIVE-STRENGTH CONFIRMATION (Weinstein's group analysis)
 
 Weinstein's method isn't purely single-stock technicals — he explicitly
 checks the stock's industry group before trusting a breakout: a Stage 2
-is far more reliable when (a) the group itself isn't topping or declining,
+is far more reliable when (a) the group itself isn't in active decline,
 and (b) the stock is outperforming its group (a rising Relative Strength
 line), not just moving with it. Both are wired in here as additional,
 independently toggleable conditions on Stage 2:
 
     require_group_strength: the stock's peer group (via `classify_group`)
-        must itself be in Stage 1 or 2, not Stage 3/4.
+        must NOT itself be in Stage 4 (active decline). Deliberately not
+        "must be Stage 1/2" — a group index is a lagging blend of a dozen+
+        stocks, so leadership stocks break out *before* their group
+        confirms. Requiring the group to already be Stage 2 would filter
+        out exactly the early leaders this check should be catching.
     require_rs_rising: the stock's price relative to its group's index
         (RS = stock close / group index) must be trending up — its own
         30w-window slope must be positive.
@@ -171,7 +175,13 @@ def classify_weekly(weekly: pd.DataFrame, params: dict = None) -> pd.DataFrame:
     )
 
     if "group_stage" in w.columns and p["require_group_strength"]:
-        stage2 = stage2 & w["group_stage"].isin([1, 2])
+        # Exclude only groups in active decline (Stage 4) -- "don't fight a
+        # falling industry." Do NOT require the group to already be Stage
+        # 1/2: leadership stocks break out *before* their group confirms,
+        # since a group index is a lagging blend of ~a dozen+ stocks. Hard-
+        # gating on group_stage in {1,2} would filter out exactly the early
+        # leaders this check should be catching.
+        stage2 = stage2 & (w["group_stage"] != 4)
     if "rs_slope_pct" in w.columns and p["require_rs_rising"]:
         stage2 = stage2 & (w["rs_slope_pct"] > 0)
 

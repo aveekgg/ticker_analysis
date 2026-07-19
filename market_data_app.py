@@ -201,12 +201,13 @@ def render_stage_help(params: dict):
     )
     if params["require_group_strength"]:
         st.markdown(
-            "- **Require peer group to be in Stage 1/2** is ON: a stock's Stage 2 won't "
-            "confirm if its own peer group is topping (Stage 3) or declining (Stage 4) — "
-            "don't buy strength in a sinking group."
+            "- **Require peer group not in decline** is ON: a stock's Stage 2 won't confirm "
+            "if its own peer group is in active decline (Stage 4) — don't buy strength in a "
+            "sinking industry. This deliberately doesn't require the group to already be "
+            "Stage 2 itself, since leadership stocks break out *before* their group does."
         )
     else:
-        st.markdown("- **Require peer group to be in Stage 1/2** is OFF: group weakness is ignored.")
+        st.markdown("- **Require peer group not in decline** is OFF: group weakness is ignored.")
     if params["require_rs_rising"]:
         st.markdown(
             "- **Require rising strength vs. peer group** is ON: a stock's Stage 2 won't "
@@ -242,8 +243,8 @@ with st.sidebar:
         format_func=lambda s: s.replace("_", " ").title(),
     )
     require_group_strength = st.checkbox(
-        "Require peer group to be in Stage 1/2", value=sc.DEFAULTS["require_group_strength"],
-        help="A stock's Stage 2 only confirms if its peer group isn't itself topping or declining.",
+        "Require peer group not in decline", value=sc.DEFAULTS["require_group_strength"],
+        help="A stock's Stage 2 only confirms if its peer group isn't itself in active decline (Stage 4).",
     )
     require_rs_rising = st.checkbox(
         "Require rising strength vs. peer group", value=sc.DEFAULTS["require_rs_rising"],
