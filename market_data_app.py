@@ -128,6 +128,42 @@ def render_sector_filters(key_prefix: str) -> set:
         return set(scoped["symbol"]) if any_filter else None
 
 
+def render_universe_selector(key_prefix: str, all_symbols: list) -> set:
+    """Choose which stocks a backtest runs over. Returns a set of symbols,
+    or None meaning "the full universe". Three modes:
+      - Full universe
+      - By sector / industry (cascading filter)
+      - Specific stocks (multiselect dropdown and/or comma-separated list)
+    """
+    mode = st.radio(
+        "Universe", ["Full universe", "By sector / industry", "Specific stocks"],
+        horizontal=True, key=f"{key_prefix}_mode",
+    )
+    if mode == "Full universe":
+        return None
+    if mode == "By sector / industry":
+        return render_sector_filters(key_prefix)
+
+    # Specific stocks: union of the multiselect and the comma-separated list.
+    picked = st.multiselect("Pick stocks", all_symbols, key=f"{key_prefix}_pick")
+    typed = st.text_input(
+        "…or paste a comma-separated list", key=f"{key_prefix}_typed",
+        placeholder="e.g. KIRLOSENG, TMPV, INFY, RELIANCE",
+    )
+    valid = set(all_symbols)
+    typed_syms = [s.strip().upper() for s in typed.split(",") if s.strip()]
+    unknown = [s for s in typed_syms if s not in valid]
+    selected = set(picked) | (set(typed_syms) & valid)
+
+    if unknown:
+        st.warning(f"Not in the universe, ignored: {', '.join(unknown)}")
+    if selected:
+        st.caption(f"{len(selected)} stock(s) selected.")
+        return selected
+    st.info("Pick at least one stock (or switch to Full universe).")
+    return set()  # empty -> nothing to run, distinct from None (full universe)
+
+
 @st.cache_data(show_spinner="Scanning the full universe for stage transitions (can take a couple minutes the first time)...")
 def get_universe_transitions(params: dict) -> pd.DataFrame:
     frames = get_price_frames()
@@ -564,7 +600,7 @@ with tab_backtest:
         icon=":material/info:",
     )
 
-    backtest_sector_symbols = render_sector_filters("backtest")
+    backtest_symbols = render_universe_selector("backtest", symbols)
 
     with st.form("backtest_form"):
         b1, b2, b3 = st.columns(3)
@@ -587,7 +623,9 @@ with tab_backtest:
 
         run_backtest = st.form_submit_button(":material/play_arrow: Run backtest", type="primary")
 
-    if run_backtest:
+    if run_backtest and backtest_symbols == set():
+        st.warning("No stocks selected — pick at least one stock or switch the universe to Full universe.")
+    elif run_backtest:
         backtest_params = {
             "start_date": pd.Timestamp(bt_start), "end_date": pd.Timestamp(bt_end),
             "entry_delay_days": entry_delay_days, "exit_delay_days": exit_delay_days,
@@ -598,9 +636,9 @@ with tab_backtest:
         transitions = get_universe_transitions(stage_params)
         with st.spinner("Running simulation..."):
             frames = get_price_frames()
-            if backtest_sector_symbols is not None:
-                transitions = transitions[transitions["symbol"].isin(backtest_sector_symbols)]
-                frames = {sym: df for sym, df in frames.items() if sym in backtest_sector_symbols}
+            if backtest_symbols is not None:
+                transitions = transitions[transitions["symbol"].isin(backtest_symbols)]
+                frames = {sym: df for sym, df in frames.items() if sym in backtest_symbols}
             result = bt.run_backtest(frames, transitions, backtest_params)
         st.session_state["backtest_result"] = result
 
@@ -649,7 +687,7 @@ with tab_signal_backtest:
         icon=":material/info:",
     )
 
-    signal_sector_symbols = render_sector_filters("signal_backtest")
+    signal_symbols = render_universe_selector("signal_backtest", symbols)
 
     with st.form("signal_backtest_form"):
         sb1, sb2 = st.columns(2)
@@ -668,17 +706,19 @@ with tab_signal_backtest:
 
         run_signal_backtest = st.form_submit_button(":material/play_arrow: Run backtest", type="primary")
 
-    if run_signal_backtest:
+    if run_signal_backtest and signal_symbols == set():
+        st.warning("No stocks selected — pick at least one stock or switch the universe to Full universe.")
+    elif run_signal_backtest:
         signal_backtest_params = {
             **score_params,
             "start_date": pd.Timestamp(sig_start), "end_date": pd.Timestamp(sig_end),
             "total_capital": sig_total_capital, "position_size": sig_position_size,
             "participation_pct": sig_participation_pct, "enable_rotation": sig_enable_rotation,
         }
-        with st.spinner("Running simulation (scoring the full universe day by day)..."):
+        with st.spinner("Running simulation (scoring the selected stocks day by day)..."):
             frames = get_price_frames()
-            if signal_sector_symbols is not None:
-                frames = {sym: df for sym, df in frames.items() if sym in signal_sector_symbols}
+            if signal_symbols is not None:
+                frames = {sym: df for sym, df in frames.items() if sym in signal_symbols}
             benchmark = get_market_benchmark()
             result = se.run_score_backtest(frames, signal_backtest_params, benchmark_close=benchmark)
         st.session_state["signal_backtest_result"] = result
