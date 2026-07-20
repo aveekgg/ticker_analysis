@@ -366,22 +366,22 @@ SECTIONS = ["Charts", "Stage screener", "Strategy backtest", "Signal backtest", 
 with st.sidebar:
     section = st.radio("Go to", SECTIONS, key="nav_section")
 
-    # Which strategy's settings are relevant here. The relevant group renders
-    # inline; the other collapses to a single expander row. (Streamlit tabs
-    # can't drive the sidebar, so navigation lives here in the left pane. And
-    # inline-vs-expander is more reliable than toggling an expander's
-    # `expanded=` param, which sticks once a user has interacted with it.)
+    # Which strategy's settings are relevant to the current section. The
+    # relevant accordion opens, the other stays collapsed. (Streamlit tabs
+    # switch client-side and never reach the server, so navigation lives here
+    # in the left pane instead.)
     stage_relevant = section in {"Charts", "Stage screener", "Strategy backtest"}
     signal_relevant = section in {"Charts", "Signal backtest"}
 
     def settings_group(title: str, relevant: bool):
-        """Inline container when relevant, collapsed expander row when not.
-        Either way the contained widgets always render, so the derived params
-        stay valid on every section."""
-        if relevant:
-            st.markdown(f"##### {title}")
-            return st.container()
-        return st.expander(title, expanded=False)
+        """A collapsible accordion that auto-opens when relevant. An expander's
+        `expanded=` is sticky once a user toggles it, so we append an invisible
+        zero-width char to the label when NOT relevant -- that makes Streamlit
+        treat it as a fresh element on each relevance flip, so the open/closed
+        default actually applies on navigation. Widgets always render, keeping
+        the derived params valid on every section."""
+        label = title if relevant else title + "​"  # zero-width space
+        return st.expander(label, expanded=relevant)
 
     with st.expander(":material/menu_book: About / how this works", expanded=False):
         render_about()
