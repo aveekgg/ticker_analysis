@@ -190,6 +190,35 @@ def get_symbol_score_trades(symbol: str, params: dict) -> pd.DataFrame:
     return se.simulate_symbol_trades(daily, params, benchmark_close=benchmark)
 
 
+@st.cache_data(show_spinner="Running the signal strategy on each group... (can take a couple minutes)")
+def get_sector_comparison(group_level: str, params: dict) -> pd.DataFrame:
+    """Run the score backtest independently on every group at `group_level`,
+    one row of metrics per group -- a leaderboard of which sector/industry the
+    signal strategy performed best in over the period. Each group gets the same
+    capital settings; the benchmark stays the full-universe index so relative
+    strength is measured against the broad market, not each subset."""
+    frames = get_price_frames()
+    sector_map = get_sector_map()
+    benchmark = get_market_benchmark()
+    rows = []
+    for group_name, grp in sector_map.groupby(group_level):
+        members = {s: frames[s] for s in grp["symbol"] if s in frames}
+        if not members:
+            continue
+        result = se.run_score_backtest(members, params, benchmark_close=benchmark)
+        m = result["metrics"]
+        rows.append({
+            "group": group_name, "stocks": len(members), "trades": m["num_trades"],
+            "total_return_%": round(m["total_return_pct"], 1),
+            "cagr_%": round(m["cagr_pct"], 1),
+            "max_drawdown_%": round(m["max_drawdown_pct"], 1),
+            "win_rate_%": round(m["win_rate_pct"], 0),
+            "avg_holding_days": round(m["avg_holding_days"], 0),
+        })
+    df = pd.DataFrame(rows)
+    return df.sort_values("total_return_%", ascending=False).reset_index(drop=True) if not df.empty else df
+
+
 def render_stage_help(params: dict):
     """Plain-language explainer for the Stage 1-4 framework and what the
     current slider settings mean."""
@@ -749,6 +778,45 @@ with tab_signal_backtest:
             )
     else:
         st.info("Set your strategy parameters above and click **Run backtest**.")
+
+    st.divider()
+    st.subheader(":material/leaderboard: Compare across sectors / industries")
+    st.caption(
+        "Runs this same signal strategy (current sidebar score settings + the date/capital "
+        "settings above) independently on every group, so you can rank which sector/industry "
+        "it performed best in over the selected period. Click any column header to re-sort."
+    )
+    cmp_col1, cmp_col2 = st.columns([1, 1])
+    with cmp_col1:
+        cmp_level = st.selectbox(
+            "Group by", ["macro_sector", "sector", "industry", "basic_industry"],
+            index=1, format_func=lambda s: s.replace("_", " ").title(), key="cmp_level",
+        )
+    with cmp_col2:
+        st.caption(
+            "Coarser levels (macro sector, sector) run in seconds; finer levels "
+            "(industry, basic industry) have more groups and take longer."
+        )
+    if st.button(":material/play_arrow: Run sector comparison", key="run_sector_cmp"):
+        comparison_params = {
+            **score_params,
+            "start_date": pd.Timestamp(sig_start), "end_date": pd.Timestamp(sig_end),
+            "total_capital": sig_total_capital, "position_size": sig_position_size,
+            "participation_pct": sig_participation_pct, "enable_rotation": sig_enable_rotation,
+        }
+        st.session_state["sector_comparison"] = get_sector_comparison(cmp_level, comparison_params)
+        st.session_state["sector_comparison_level"] = cmp_level
+
+    if "sector_comparison" in st.session_state:
+        comp_df = st.session_state["sector_comparison"].rename(
+            columns={"group": st.session_state.get("sector_comparison_level", "group")}
+        )
+        st.caption(f"{len(comp_df)} groups, ranked by total return (click headers to re-sort).")
+        st.dataframe(comp_df, width="stretch", height=430, hide_index=True)
+        st.download_button(
+            "Download comparison as CSV", comp_df.to_csv(index=False),
+            file_name="sector_comparison.csv", mime="text/csv",
+        )
 
 with tab_query:
     st.subheader("Tables")
