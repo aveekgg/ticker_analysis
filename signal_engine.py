@@ -173,6 +173,66 @@ def get_buy_triggers(scored: pd.DataFrame) -> pd.DataFrame:
     return hits[["close", "score"]].reset_index().rename(columns={"index": "date"})
 
 
+def simulate_symbol_trades(daily: pd.DataFrame, params: dict = None,
+                            benchmark_close: pd.Series = None) -> pd.DataFrame:
+    """Non-overlapping buy/sell trades for a SINGLE symbol, with no capital
+    constraint -- used for the chart overlay so every signal's trade is
+    plotted (the capital-constrained `run_score_backtest` would hide trades
+    once cash is tied up, which is wrong for visualizing one stock's history).
+
+    Walks buy signals in order: when flat, enter at that day's close; then
+    exit at the earliest of stop-loss / trailing-stop / max-holding; resume
+    scanning for the next buy signal after the exit.
+    """
+    p = {**DEFAULTS, **(params or {})}
+    scored = generate_signals(daily, p, benchmark_close)
+    closes = scored["close"]
+    dates = list(scored.index)
+    buy_flags = scored["buy_signal"].to_numpy()
+
+    trades = []
+    i = 0
+    n = len(dates)
+    while i < n:
+        if not buy_flags[i]:
+            i += 1
+            continue
+        entry_date = dates[i]
+        entry_price = closes.iloc[i]
+        if entry_price <= 0 or pd.isna(entry_price):
+            i += 1
+            continue
+        stop_price = entry_price * (1 - p["stop_loss_pct"] / 100)
+        peak = entry_price
+        exit_idx = None
+        exit_reason = None
+        j = i + 1
+        while j < n:
+            px = closes.iloc[j]
+            peak = max(peak, px)
+            trailing_price = peak * (1 - p["trailing_stop_pct"] / 100)
+            holding_days = (dates[j] - entry_date).days
+            if px <= stop_price:
+                exit_idx, exit_reason = j, "stop_loss"; break
+            if px <= trailing_price:
+                exit_idx, exit_reason = j, "trailing_stop"; break
+            if holding_days >= p["max_holding_days"]:
+                exit_idx, exit_reason = j, "max_holding"; break
+            j += 1
+        if exit_idx is None:
+            exit_idx, exit_reason = n - 1, "end_of_data"
+        exit_price = closes.iloc[exit_idx]
+        trades.append({
+            "entry_date": entry_date, "entry_price": entry_price,
+            "exit_date": dates[exit_idx], "exit_price": exit_price, "exit_reason": exit_reason,
+            "pnl_pct": (exit_price / entry_price - 1) * 100,
+            "holding_days": (dates[exit_idx] - entry_date).days,
+        })
+        i = exit_idx + 1  # resume after this trade's exit
+
+    return pd.DataFrame(trades)
+
+
 def scan_universe(price_frames: dict, params: dict = None, benchmark_close: pd.Series = None,
                    progress_cb=None) -> pd.DataFrame:
     """Buy triggers for every symbol in price_frames, concatenated with a

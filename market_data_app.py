@@ -143,18 +143,15 @@ def get_market_benchmark() -> pd.Series:
 
 @st.cache_data
 def get_symbol_score_trades(symbol: str, params: dict) -> pd.DataFrame:
-    """Single-symbol score-engine buy/sell pairs, for the Charts tab overlay
-    -- runs the same backtest mechanics scoped to just this one stock."""
+    """Every non-overlapping score-engine buy/sell trade for one symbol, for
+    the Charts tab overlay -- uses the capital-free single-symbol simulator so
+    all signals plot (a capital-constrained backtest would hide trades once
+    the position is funded)."""
     daily = get_prices(symbol)
     if daily.empty:
         return pd.DataFrame()
     benchmark = get_market_benchmark()
-    full_params = {
-        **params, "start_date": daily["date"].min(), "end_date": daily["date"].max(),
-        "position_size": params["total_capital"],  # single symbol -- always fully sized
-    }
-    result = se.run_score_backtest({symbol: daily}, full_params, benchmark_close=benchmark)
-    return result["trades"]
+    return se.simulate_symbol_trades(daily, params, benchmark_close=benchmark)
 
 
 def render_stage_help(params: dict):
@@ -437,16 +434,30 @@ with tab_charts:
                 visible_trades = score_trades[
                     (score_trades["entry_date"].dt.date >= date_range[0]) & (score_trades["entry_date"].dt.date <= date_range[1])
                 ]
+                BUY_COLOR, SELL_COLOR = "#2ecc71", "#e74c3c"
+                # Buys and sells as full-height vertical lines, each tagged with
+                # an up/down arrow at the BOTTOM of the price panel. The stage
+                # annotations own the top (S1-S4 labels), so keeping the score
+                # arrows at the bottom cleanly separates the two systems.
+                for _, t in visible_trades.iterrows():
+                    fig.add_vline(x=t["entry_date"], line_width=1.5, line_dash="dot",
+                                  line_color=BUY_COLOR, row=1, col=1)
+                    fig.add_annotation(x=t["entry_date"], y=0.01, yref="y domain", yanchor="bottom",
+                                       row=1, col=1, text="▲", showarrow=False,
+                                       font=dict(color=BUY_COLOR, size=15))
+                    fig.add_vline(x=t["exit_date"], line_width=1.5, line_dash="dot",
+                                  line_color=SELL_COLOR, row=1, col=1)
+                    fig.add_annotation(x=t["exit_date"], y=0.01, yref="y domain", yanchor="bottom",
+                                       row=1, col=1, text="▼", showarrow=False,
+                                       font=dict(color=SELL_COLOR, size=15))
+                # Invisible traces purely to keep Score buy / Score sell in the legend.
                 fig.add_trace(go.Scatter(
-                    x=visible_trades["entry_date"], y=visible_trades["entry_price"],
-                    mode="markers", name="Score buy",
-                    marker=dict(symbol="triangle-up", size=11, color="#2ecc71", line=dict(width=1, color="white")),
+                    x=[None], y=[None], mode="markers", name="Score buy",
+                    marker=dict(symbol="triangle-up", size=11, color=BUY_COLOR),
                 ), row=1, col=1)
                 fig.add_trace(go.Scatter(
-                    x=visible_trades["exit_date"], y=visible_trades["exit_price"],
-                    mode="markers", name="Score sell",
-                    marker=dict(symbol="triangle-down", size=11, color="#e74c3c", line=dict(width=1, color="white")),
-                    text=visible_trades["exit_reason"], hovertemplate="%{text}<br>%{y:.2f}<extra></extra>",
+                    x=[None], y=[None], mode="markers", name="Score sell",
+                    marker=dict(symbol="triangle-down", size=11, color=SELL_COLOR),
                 ), row=1, col=1)
 
         fig.update_layout(
