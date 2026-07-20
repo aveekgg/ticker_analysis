@@ -305,38 +305,115 @@ def render_stage_help(params: dict):
         st.markdown("- **Require rising strength vs. peer group** is OFF: relative strength is ignored.")
 
 
+def render_about():
+    """Full explainer for the two independent strategies, shown in the
+    sidebar 'About' pane."""
+    st.markdown("### :material/menu_book: About this app")
+    st.markdown(
+        "Two **independent** ways to decide buy/sell, both from OHLCV data only:"
+    )
+    st.markdown(
+        "1. **Weinstein Stage 1-4** — a trend-regime label from the 30-week moving "
+        "average (base → advance → top → decline), with peer-group confirmation.\n"
+        "2. **Signal score** — a 0-100 score from six price/volume factors; a buy "
+        "fires when it crosses your threshold."
+    )
+    st.caption("Use the 'What does this mean?' button for the Stage framework. The Signal score system is explained below.")
+
+    st.divider()
+    st.markdown("#### :material/query_stats: How the Signal score works")
+    st.markdown(
+        "Every day, each stock gets a **0-100 score** = the sum of six weighted factors. "
+        "A high score is a stock that's **trending up, tightly based on drying volume, "
+        "near its highs, and beating the market** — the classic accumulation setup."
+    )
+    st.markdown(
+        "| Factor | Full credit when… |\n"
+        "|---|---|\n"
+        "| **1-month return** | 20-day return ≥ 20% |\n"
+        "| **EMA alignment** | close > EMA20 > EMA50 > EMA200 |\n"
+        "| **Volume dry-up** | 5-day avg volume ≤ 0.7× the 20-day avg |\n"
+        "| **ATR compression** | volatility well below 20 days ago |\n"
+        "| **Near high** | price at its 60-day high |\n"
+        "| **Relative strength** | beats the market benchmark by 20% |"
+    )
+    st.markdown(
+        "- Each **factor weight** sets how much that trait counts toward the score "
+        "(defaults sum to 100). Raise a weight to make that trait matter more; set it to 0 to ignore it.\n"
+        "- The **buy threshold** is the score a stock must cross *up through* to trigger a buy. "
+        "Higher = fewer, higher-conviction signals.\n"
+        "- **Exit rules** close a trade at the earliest of the **stop loss**, a **trailing stop** "
+        "(from the highest price reached), or the **max holding period**."
+    )
+    st.caption(
+        "The market benchmark for relative strength is an equal-weighted index of the whole "
+        "universe — so 'outperformance' always means vs. the broad market, even when you filter "
+        "to a few stocks."
+    )
+    st.markdown(
+        "These settings drive the **Signal buy/sell markers** on Charts, the **Signal backtest**, "
+        "and the **sector leaderboard**."
+    )
+
+
 st.title("NSE Market Data")
 
 symbols = get_symbols()
 
 # --- Sidebar: stage classifier settings, shared across Charts / Screener / Backtest ---
-with st.sidebar:
-    st.header(":material/tune: Stage classifier settings")
-    st.caption("Shared across the Charts, Stage screener, and Strategy backtest tabs.")
+SECTIONS = ["Charts", "Stage screener", "Strategy backtest", "Signal backtest", "Query / Tables"]
 
-    weekly_flat_pct = st.slider("30w MA flat threshold (%/week)", 0.05, 1.0, sc.DEFAULTS["weekly_flat_pct"], 0.05)
-    daily_flat_pct = st.slider("200d/50d MA flat threshold (%/day)", 0.01, 0.3, sc.DEFAULTS["daily_flat_pct"], 0.01)
-    whipsaw_band_pct = st.slider("Stage 1 whipsaw band (% of 30w MA)", 5.0, 25.0, sc.DEFAULTS["whipsaw_band_pct"], 1.0)
-    distribution_vol_mult = st.slider("Stage 3 distribution volume (x 50d avg)", 1.0, 3.0, sc.DEFAULTS["distribution_vol_mult"], 0.1)
-    breakout_vol_mult = st.slider("Stage 2 breakout volume (x 50d avg)", 1.5, 4.0, sc.DEFAULTS["breakout_vol_mult"], 0.1)
-    failed_breakout_giveback_pct = st.slider("Failed-breakout giveback (%)", 1.0, 10.0, sc.DEFAULTS["failed_breakout_giveback_pct"], 0.5)
-    min_run_weeks = st.slider("Min. weeks to confirm a stage", 1, 8, sc.DEFAULTS["min_run_weeks"], 1)
+with st.sidebar:
+    section = st.radio("Go to", SECTIONS, key="nav_section")
+
+    # Which strategy's settings are relevant here. The relevant group renders
+    # inline; the other collapses to a single expander row. (Streamlit tabs
+    # can't drive the sidebar, so navigation lives here in the left pane. And
+    # inline-vs-expander is more reliable than toggling an expander's
+    # `expanded=` param, which sticks once a user has interacted with it.)
+    stage_relevant = section in {"Charts", "Stage screener", "Strategy backtest"}
+    signal_relevant = section in {"Charts", "Signal backtest"}
+
+    def settings_group(title: str, relevant: bool):
+        """Inline container when relevant, collapsed expander row when not.
+        Either way the contained widgets always render, so the derived params
+        stay valid on every section."""
+        if relevant:
+            st.markdown(f"##### {title}")
+            return st.container()
+        return st.expander(title, expanded=False)
+
+    with st.expander(":material/menu_book: About / how this works", expanded=False):
+        render_about()
 
     st.divider()
-    st.caption(":material/groups: Group / relative-strength confirmation (Weinstein's group analysis)")
-    group_level = st.selectbox(
-        "Peer group defined by", ["macro_sector", "sector", "industry", "basic_industry"],
-        index=["macro_sector", "sector", "industry", "basic_industry"].index(sc.DEFAULTS["group_level"]),
-        format_func=lambda s: s.replace("_", " ").title(),
-    )
-    require_group_strength = st.checkbox(
-        "Require peer group not in decline", value=sc.DEFAULTS["require_group_strength"],
-        help="A stock's Stage 2 only confirms if its peer group isn't itself in active decline (Stage 4).",
-    )
-    require_rs_rising = st.checkbox(
-        "Require rising strength vs. peer group", value=sc.DEFAULTS["require_rs_rising"],
-        help="A stock's Stage 2 only confirms if it's outperforming its peer group, not just moving with it.",
-    )
+    with settings_group(":material/tune: Stage classifier settings", stage_relevant):
+        weekly_flat_pct = st.slider("30w MA flat threshold (%/week)", 0.05, 1.0, sc.DEFAULTS["weekly_flat_pct"], 0.05)
+        daily_flat_pct = st.slider("200d/50d MA flat threshold (%/day)", 0.01, 0.3, sc.DEFAULTS["daily_flat_pct"], 0.01)
+        whipsaw_band_pct = st.slider("Stage 1 whipsaw band (% of 30w MA)", 5.0, 25.0, sc.DEFAULTS["whipsaw_band_pct"], 1.0)
+        distribution_vol_mult = st.slider("Stage 3 distribution volume (x 50d avg)", 1.0, 3.0, sc.DEFAULTS["distribution_vol_mult"], 0.1)
+        breakout_vol_mult = st.slider("Stage 2 breakout volume (x 50d avg)", 1.5, 4.0, sc.DEFAULTS["breakout_vol_mult"], 0.1)
+        failed_breakout_giveback_pct = st.slider("Failed-breakout giveback (%)", 1.0, 10.0, sc.DEFAULTS["failed_breakout_giveback_pct"], 0.5)
+        min_run_weeks = st.slider("Min. weeks to confirm a stage", 1, 8, sc.DEFAULTS["min_run_weeks"], 1)
+
+        st.caption(":material/groups: Group / relative-strength confirmation (Weinstein's group analysis)")
+        group_level = st.selectbox(
+            "Peer group defined by", ["macro_sector", "sector", "industry", "basic_industry"],
+            index=["macro_sector", "sector", "industry", "basic_industry"].index(sc.DEFAULTS["group_level"]),
+            format_func=lambda s: s.replace("_", " ").title(),
+        )
+        require_group_strength = st.checkbox(
+            "Require peer group not in decline", value=sc.DEFAULTS["require_group_strength"],
+            help="A stock's Stage 2 only confirms if its peer group isn't itself in active decline (Stage 4).",
+        )
+        require_rs_rising = st.checkbox(
+            "Require rising strength vs. peer group", value=sc.DEFAULTS["require_rs_rising"],
+            help="A stock's Stage 2 only confirms if it's outperforming its peer group, not just moving with it.",
+        )
+        if "show_help" not in st.session_state:
+            st.session_state.show_help = False
+        if st.button(":material/help: What does this mean?", width="stretch"):
+            st.session_state.show_help = not st.session_state.show_help
 
     stage_params = {
         **sc.DEFAULTS,
@@ -351,27 +428,49 @@ with st.sidebar:
         "require_group_strength": require_group_strength,
         "require_rs_rising": require_rs_rising,
     }
+    if st.session_state.show_help:
+        with st.container(border=True):
+            render_stage_help(stage_params)
 
-    st.divider()
-    st.header(":material/query_stats: Signal score settings")
-    st.caption("A second, independent buy/sell system: a 0-100 OHLCV-derived score instead of Weinstein stages.")
-    with st.expander("Factor weights", expanded=False):
-        weight_return = st.slider("1-month return", 0.0, 40.0, se.DEFAULTS["weight_return"], 1.0)
-        weight_ema_alignment = st.slider("EMA alignment", 0.0, 40.0, se.DEFAULTS["weight_ema_alignment"], 1.0)
-        weight_volume_dryup = st.slider("Volume dry-up", 0.0, 40.0, se.DEFAULTS["weight_volume_dryup"], 1.0)
-        weight_atr_compression = st.slider("ATR compression", 0.0, 40.0, se.DEFAULTS["weight_atr_compression"], 1.0)
-        weight_near_high = st.slider("Near high", 0.0, 40.0, se.DEFAULTS["weight_near_high"], 1.0)
-        weight_relative_strength = st.slider("Relative strength vs. market", 0.0, 40.0, se.DEFAULTS["weight_relative_strength"], 1.0)
+    with settings_group(":material/query_stats: Signal score settings", signal_relevant):
+        st.caption("A second, independent buy/sell system: a 0-100 OHLCV-derived score. See **About** above for the full explainer.")
+        st.markdown("**Factor weights** — how much each trait counts toward the 0-100 score.")
+        weight_return = st.slider(
+            "1-month return", 0.0, 40.0, se.DEFAULTS["weight_return"], 1.0,
+            help="Rewards recent price momentum (20-day return). Higher weight = fast movers dominate the score; 0 = ignore momentum.")
+        weight_ema_alignment = st.slider(
+            "EMA alignment", 0.0, 40.0, se.DEFAULTS["weight_ema_alignment"], 1.0,
+            help="Rewards a clean uptrend stack (close > EMA20 > EMA50 > EMA200). Higher = trend structure matters more.")
+        weight_volume_dryup = st.slider(
+            "Volume dry-up", 0.0, 40.0, se.DEFAULTS["weight_volume_dryup"], 1.0,
+            help="Rewards shrinking volume (quiet basing / accumulation). Higher = quiet bases count for more.")
+        weight_atr_compression = st.slider(
+            "ATR compression", 0.0, 40.0, se.DEFAULTS["weight_atr_compression"], 1.0,
+            help="Rewards falling volatility vs 20 days ago (a tightening coil). Higher = tight consolidations count for more.")
+        weight_near_high = st.slider(
+            "Near high", 0.0, 40.0, se.DEFAULTS["weight_near_high"], 1.0,
+            help="Rewards price sitting near its 60-day high. Higher = only near-breakout stocks score.")
+        weight_relative_strength = st.slider(
+            "Relative strength vs. market", 0.0, 40.0, se.DEFAULTS["weight_relative_strength"], 1.0,
+            help="Rewards beating the broad-market benchmark. Higher = only true outperformers score.")
         total_weight = (weight_return + weight_ema_alignment + weight_volume_dryup +
                          weight_atr_compression + weight_near_high + weight_relative_strength)
         st.caption(f"Max possible score: {total_weight:.0f}")
 
-    buy_score_threshold = st.slider("Buy score threshold", 20.0, min(100.0, total_weight) if total_weight else 100.0,
-                                     min(se.DEFAULTS["buy_score_threshold"], total_weight) if total_weight else 60.0, 1.0)
-    with st.expander("Exit rules", expanded=False):
-        se_stop_loss_pct = st.slider("Stop loss (%)", 1.0, 20.0, se.DEFAULTS["stop_loss_pct"], 0.5, key="se_sl")
-        trailing_stop_pct = st.slider("Trailing stop (%)", 1.0, 30.0, se.DEFAULTS["trailing_stop_pct"], 0.5)
-        max_holding_days = st.slider("Max holding period (days)", 5, 180, se.DEFAULTS["max_holding_days"], 5)
+        buy_score_threshold = st.slider(
+            "Buy score threshold", 20.0, min(100.0, total_weight) if total_weight else 100.0,
+            min(se.DEFAULTS["buy_score_threshold"], total_weight) if total_weight else 60.0, 1.0,
+            help="Score a stock must cross UP through to trigger a buy. Higher = fewer, higher-conviction signals; lower = more, weaker signals.")
+        st.markdown("**Exit rules** — a trade closes at the earliest of these.")
+        se_stop_loss_pct = st.slider(
+            "Stop loss (%)", 1.0, 20.0, se.DEFAULTS["stop_loss_pct"], 0.5, key="se_sl",
+            help="Sell if price falls this far below your entry. Lower = tighter risk, cut losers faster; higher = more room, fewer whipsaws.")
+        trailing_stop_pct = st.slider(
+            "Trailing stop (%)", 1.0, 30.0, se.DEFAULTS["trailing_stop_pct"], 0.5,
+            help="Sell if price falls this far below the highest price reached since entry (locks in gains as it runs). Lower = protect profits sooner; higher = let winners breathe.")
+        max_holding_days = st.slider(
+            "Max holding period (days)", 5, 180, se.DEFAULTS["max_holding_days"], 5,
+            help="Force an exit after this many days regardless. Lower = faster capital turnover; higher = give trades more time to work.")
 
     score_params = {
         **se.DEFAULTS,
@@ -382,20 +481,7 @@ with st.sidebar:
         "trailing_stop_pct": trailing_stop_pct, "max_holding_days": max_holding_days,
     }
 
-    st.divider()
-    if "show_help" not in st.session_state:
-        st.session_state.show_help = False
-    if st.button(":material/help: What does this mean?", width="stretch"):
-        st.session_state.show_help = not st.session_state.show_help
-    if st.session_state.show_help:
-        with st.container(border=True):
-            render_stage_help(stage_params)
-
-tab_charts, tab_screener, tab_backtest, tab_signal_backtest, tab_query = st.tabs(
-    ["Charts", "Stage screener", "Strategy backtest", "Signal backtest", "Query / Tables"]
-)
-
-with tab_charts:
+if section == "Charts":
     col1, col2 = st.columns([1, 3])
     with col1:
         symbol = st.selectbox("Symbol", symbols, key="symbol_select",
@@ -566,7 +652,7 @@ with tab_charts:
                     width="stretch", height=250,
                 )
 
-with tab_screener:
+if section == "Stage screener":
     st.caption(
         "Find stocks that entered a given stage within a date window, using the classifier "
         "settings in the sidebar. First scan takes ~a minute across the full universe; "
@@ -616,7 +702,7 @@ with tab_screener:
     else:
         st.info("Click **Scan universe** to run the screen.")
 
-with tab_backtest:
+if section == "Strategy backtest":
     st.caption(
         "Simulate: buy N days after a Stage 2 confirmation, sell at the earliest of a stop-loss "
         "or N days after the first Stage 3/4 confirmation after entry. Uses the same universe "
@@ -702,7 +788,7 @@ with tab_backtest:
     else:
         st.info("Set your strategy parameters above and click **Run backtest**.")
 
-with tab_signal_backtest:
+if section == "Signal backtest":
     st.caption(
         "A second, independent system: buy when the OHLCV-derived score crosses above the "
         "threshold (see sidebar), sell at the earliest of a stop-loss, a trailing stop, or the "
@@ -818,7 +904,7 @@ with tab_signal_backtest:
             file_name="sector_comparison.csv", mime="text/csv",
         )
 
-with tab_query:
+if section == "Query / Tables":
     st.subheader("Tables")
     con = get_connection()
     table_choice = st.selectbox("Preview table", ["instruments", "daily_prices"])
