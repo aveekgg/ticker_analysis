@@ -10,6 +10,8 @@
 !stage_classifier.py
 !backtester.py
 !signal_engine.py
+!scrape_fundamentals.py
+!fundamentals.csv
 !nse_market_data.duckdb
 !.streamlit/
 !.streamlit/**
