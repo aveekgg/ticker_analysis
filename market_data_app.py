@@ -1216,103 +1216,105 @@ if section == "Sector leaders":
     )
 
     date_lo, date_hi = get_price_date_range()
-    lc1, lc2, lc3, lc4, lc5 = st.columns(5)
-    with lc1:
-        leader_level = st.selectbox(
-            "Group by", ["macro_sector", "sector", "industry", "basic_industry"],
-            index=1, format_func=lambda s: s.replace("_", " ").title(), key="leader_level",
-        )
-    with lc2:
-        leader_end = st.date_input(
-            "End date", value=date_hi.date(),
-            min_value=date_lo.date(), max_value=date_hi.date(), key="leader_end_date",
-            help="The lookback period counts back from this date. Defaults to the latest "
-            "trading day; set it earlier to study leadership as of a past date.",
-        )
-    with lc3:
-        leader_period = st.selectbox("Lookback period", list(LEADER_PERIODS), index=2, key="leader_period")
-    period_days = LEADER_PERIODS[leader_period]
-    window_opts = [w for w, (d, _) in LEADER_WINDOWS.items() if d * 4 <= period_days]
-    with lc4:
-        leader_window = st.selectbox(
-            "Comparison window", window_opts,
-            index=window_opts.index("3 months") if "3 months" in window_opts else len(window_opts) - 1,
-            key="leader_window",
-            help="Only windows that give at least 4 full comparisons within the lookback are offered.",
-        )
-    with lc5:
-        min_consistency = st.slider(
-            "Min. windows beaten (%)", 0, 100, 60, 5, key="leader_min_consistency",
-            help="Only show stocks that beat their group in at least this share of windows.",
-        )
-    leader_end_ts = pd.Timestamp(leader_end)
-
-    sc1, sc2, sc3 = st.columns([1.3, 1.3, 2.4])
-    with sc1:
-        scan_mode = st.segmented_control(
-            "Scan mode", ["Rolling", "Non-overlapping"], default="Rolling", key="leader_scan_mode",
-            help="**Rolling** slides the window forward in small steps so it overlaps — many "
-            "windows, robust to where boundaries fall, best for *identifying* durable leaders "
-            "(but overlap means the hit rate is a stable estimate, not independent trials). "
-            "**Non-overlapping** uses back-to-back windows — few but statistically independent, "
-            "a good cross-check.",
-        )
-    with sc2:
-        if scan_mode == "Rolling":
-            step_label = st.selectbox(
-                "Rolling step", list(LEADER_STEPS), index=2, key="leader_step",
-                help="How far each window's end date slides. Smaller steps = more windows and a "
-                "smoother, more phase-robust consistency estimate.",
-            )
-        else:
-            step_label = None
-            st.caption(":material/info: Back-to-back windows: independent samples, but few and "
-                       "sensitive to the exact end date.")
-    with sc3:
-        st.caption(
-            "Rolling scans the whole period for every window of the chosen length that ends "
-            "on/before the end date, so a leader isn't missed just because it fell between "
-            "fixed quarter boundaries. Set mode to Non-overlapping to reproduce the old "
-            "floor(period ÷ window) behaviour."
-        )
-
     mcap_df = get_mcap_map()
     has_mcap = not mcap_df.empty
 
-    lo1, lo2, lo3 = st.columns([1.2, 1, 1.8])
-    with lo1:
-        full_history_only = st.checkbox(
-            "Full-period history only", value=True, key="leader_full_history",
-            help="Exclude stocks that listed after the period started (their consistency is measured on fewer windows).",
-        )
-        min_peers = st.number_input(
-            "Min. stocks in group", 2, 50, 3, 1, key="leader_min_peers",
-            help="Groups with very few members make 'beating the group' close to meaningless.",
-        )
-    with lo2:
-        top_n_choice = st.selectbox(
-            "Show", ["All stocks", "Top 3 per group", "Top 5 per group"],
-            key="leader_top_n",
-        )
-    with lo3:
-        if has_mcap:
-            mcap_stops = mcap_ladder(mcap_df["mcap_cr"].max())
-            mcap_range = st.select_slider(
-                "Market-cap range (₹ cr)", options=mcap_stops,
-                value=(mcap_stops[0], mcap_stops[-1]), format_func=format_mcap_cr,
-                key="leader_mcap_range",
-                help="Filter the leaderboard to a market-cap band. Steps get coarser as cap "
-                "rises (5k → 10k → 20k → 50k → 100k) since most of the universe is small-cap. "
-                "Controls for base effect: small caps move differently from the large caps that "
-                "dominate a sector's story. Full range = no filter.",
+    # Group 1 — what we measure over.
+    with st.container(border=True):
+        st.caption(":material/date_range: Measurement window")
+        w1, w2, w3, w4 = st.columns(4, vertical_alignment="bottom")
+        with w1:
+            leader_level = st.selectbox(
+                "Group by", ["macro_sector", "sector", "industry", "basic_industry"],
+                index=1, format_func=lambda s: s.replace("_", " ").title(), key="leader_level",
             )
-        else:
-            mcap_range = None
-            st.info(
-                "No market-cap snapshot found (`fundamentals.csv`), so size "
-                "segmentation is off. Run `python scrape_fundamentals.py` to scrape it "
-                "from screener.in (resumable, ~20 min); this tab picks it up automatically.",
-                icon=":material/scale:",
+        with w2:
+            leader_end = st.date_input(
+                "End date", value=date_hi.date(),
+                min_value=date_lo.date(), max_value=date_hi.date(), key="leader_end_date",
+                help="The lookback period counts back from this date. Defaults to the latest "
+                "trading day; set it earlier to study leadership as of a past date.",
+            )
+        with w3:
+            leader_period = st.selectbox("Lookback period", list(LEADER_PERIODS), index=2, key="leader_period")
+        period_days = LEADER_PERIODS[leader_period]
+        window_opts = [w for w, (d, _) in LEADER_WINDOWS.items() if d * 4 <= period_days]
+        with w4:
+            leader_window = st.selectbox(
+                "Comparison window", window_opts,
+                index=window_opts.index("3 months") if "3 months" in window_opts else len(window_opts) - 1,
+                key="leader_window",
+                help="Only windows that give at least 4 full comparisons within the lookback are offered.",
+            )
+    leader_end_ts = pd.Timestamp(leader_end)
+
+    # Group 2 — how we scan the window and the consistency bar.
+    with st.container(border=True):
+        st.caption(":material/travel_explore: Scan & consistency")
+        s1, s2, s3 = st.columns(3, vertical_alignment="bottom")
+        with s1:
+            scan_mode = st.segmented_control(
+                "Scan mode", ["Rolling", "Non-overlapping"], default="Rolling", key="leader_scan_mode",
+                help="**Rolling** slides the window forward in small steps so it overlaps — many "
+                "windows, robust to where boundaries fall, best for *identifying* durable leaders "
+                "(but overlap means the hit rate is a stable estimate, not independent trials). "
+                "**Non-overlapping** uses back-to-back windows — few but statistically independent, "
+                "a good cross-check.",
+            )
+        with s2:
+            if scan_mode == "Rolling":
+                step_label = st.selectbox(
+                    "Rolling step", list(LEADER_STEPS), index=2, key="leader_step",
+                    help="How far each window's end date slides. Smaller steps = more windows and a "
+                    "smoother, more phase-robust consistency estimate.",
+                )
+            else:
+                step_label = None
+                st.selectbox(
+                    "Rolling step", ["— not applicable"], disabled=True, key="leader_step_off",
+                    help="Non-overlapping uses back-to-back windows: independent samples, but few "
+                    "and sensitive to the exact end date.",
+                )
+        with s3:
+            min_consistency = st.slider(
+                "Min. windows beaten (%)", 0, 100, 60, 5, key="leader_min_consistency",
+                help="Only show names that beat their group in at least this share of windows. "
+                "(Not applied to the Aggregate groups view, which ranks every group.)",
+            )
+
+    # Group 3 — narrow / display the results.
+    with st.container(border=True):
+        st.caption(":material/filter_alt: Filters & display")
+        f1, f2, f3, f4 = st.columns([2.2, 1, 1, 1], vertical_alignment="bottom")
+        with f1:
+            if has_mcap:
+                mcap_stops = mcap_ladder(mcap_df["mcap_cr"].max())
+                mcap_range = st.select_slider(
+                    "Market-cap range (₹ cr)", options=mcap_stops,
+                    value=(mcap_stops[0], mcap_stops[-1]), format_func=format_mcap_cr,
+                    key="leader_mcap_range",
+                    help="Filter to a market-cap band. Steps coarsen as cap rises (5k → 10k → 20k "
+                    "→ 50k → 100k). Controls for base effect; full range = no filter.",
+                )
+            else:
+                mcap_range = None
+                st.caption(":material/scale: No market-cap snapshot — size filter off. "
+                           "Run `python scrape_fundamentals.py` to enable it.")
+        with f2:
+            top_n_choice = st.selectbox(
+                "Show", ["All stocks", "Top 3 per group", "Top 5 per group"],
+                key="leader_top_n",
+                help="Individual-stocks view only: cap how many names show per group.",
+            )
+        with f3:
+            min_peers = st.number_input(
+                "Min. stocks in group", 2, 50, 3, 1, key="leader_min_peers",
+                help="Groups with very few members make 'beating the group' close to meaningless.",
+            )
+        with f4:
+            full_history_only = st.checkbox(
+                "Full-period history only", value=True, key="leader_full_history",
+                help="Exclude stocks that listed after the period started (measured on fewer windows).",
             )
 
     with st.expander(":material/warning: Caveats before you read too much into this"):
