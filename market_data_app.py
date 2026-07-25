@@ -34,6 +34,53 @@ DB_FILE = "nse_market_data.duckdb"
 st.set_page_config(page_title="NSE Market Data", layout="wide")
 
 
+def inject_mobile_css():
+    """One responsive stylesheet so the whole app is usable on a phone. Streamlit
+    exposes no server-side viewport width, so instead of device-branching the
+    Python layout we restyle at <=640px via stable data-testid hooks. Desktop
+    (>640px) is untouched. The main move: force every multi-column row to stack,
+    which fixes all the 4-5 column control rows and metric rows at once."""
+    st.markdown(
+        """
+        <style>
+        @media (max-width: 640px) {
+            /* Stack every st.columns row instead of squishing side-by-side */
+            [data-testid="stHorizontalBlock"] { flex-wrap: wrap; gap: 0.5rem; }
+            [data-testid="stColumn"] {
+                flex: 1 1 100% !important;
+                width: 100% !important;
+                min-width: 100% !important;
+            }
+            /* Reclaim the wide desktop side padding */
+            [data-testid="stMainBlockContainer"] { padding: 1rem 0.75rem 4rem; }
+            /* Tame the oversized title / headers */
+            [data-testid="stMainBlockContainer"] h1 { font-size: 1.6rem; line-height: 1.2; }
+            [data-testid="stMainBlockContainer"] h2 { font-size: 1.3rem; }
+            [data-testid="stMainBlockContainer"] h3 { font-size: 1.1rem; }
+            /* Comfortable tap targets (~44px) */
+            button[data-testid^="stBaseButton"] { min-height: 44px; }
+            [data-testid="stSelectbox"] div[data-baseweb="select"] > div { min-height: 44px; }
+            [data-testid="stNumberInput"] input,
+            [data-testid="stTextInput"] input,
+            [data-testid="stDateInput"] input { min-height: 40px; }
+            [data-testid="stSlider"] [role="slider"] { height: 22px; width: 22px; }
+            /* Full-width, self-scrolling data + charts */
+            [data-testid="stDataFrame"] { width: 100% !important; }
+            [data-testid="stPlotlyChart"], .js-plotly-plot { width: 100% !important; }
+            /* The Plotly modebar icons are unusable on touch and overlap the chart */
+            .js-plotly-plot .modebar { display: none !important; }
+            /* Open the sidebar as a near-full-width drawer so settings are readable */
+            [data-testid="stSidebar"] { min-width: 85vw !important; }
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+inject_mobile_css()
+
+
 @st.cache_resource
 def get_connection():
     return duckdb.connect(DB_FILE, read_only=True)
@@ -234,6 +281,11 @@ LEADER_WINDOWS = {  # label -> (approx days, offset) ; offset walks bounds back 
     "6 months": (182, pd.DateOffset(months=6)),
     "1 year": (365, pd.DateOffset(years=1)),
 }
+LEADER_STEPS = {  # rolling-scan step -> how far each window's end date walks back
+    "1 week": pd.DateOffset(weeks=1),
+    "2 weeks": pd.DateOffset(weeks=2),
+    "1 month": pd.DateOffset(months=1),
+}
 
 
 @st.cache_data(show_spinner="Building the universe close-price matrix (first time only)...")
@@ -310,14 +362,23 @@ def format_mcap_cr(v: float) -> str:
 
 @st.cache_data(show_spinner="Computing window returns vs peer-group index...")
 def compute_sector_leaders(group_level: str, period_days: int, window_label: str,
-                            end_date: pd.Timestamp = None) -> dict:
-    """For every stock: split the lookback into non-overlapping windows counting
-    back from `end_date` (the last trading day at/before it; defaults to the
-    latest date), compute each window's return, the equal-weighted peer-group
-    index return for the same window, and the delta. Consistency = share of
-    windows where the stock beat its group. A stock only counts in windows where
-    it has price data, and each window's group index is the mean over members
-    with data then."""
+                            end_date: pd.Timestamp = None, step_label: str = None) -> dict:
+    """For every stock: measure how consistently it beat its equal-weighted
+    peer-group index over `window_label`-long windows inside the lookback.
+
+    Two scan modes, both anchored so windows end on/before `end_date`:
+      - Non-overlapping (step_label=None): back-to-back windows, floor(period /
+        window) of them. Independent samples, but few and phase-locked to where
+        the end date happens to fall.
+      - Rolling (step_label set): windows of the same length whose end dates
+        walk back by `step_label`, so they overlap. Many more windows, robust to
+        boundary placement -- but overlapping, so the hit rate is a stable
+        estimate, not an independent-trial count.
+
+    Consistency = share of a stock's windows that beat its group. Also reports
+    the median and worst per-window excess so 'how much' and the downside tail
+    show up, not just 'how often'. A stock only counts in windows it has data
+    for; each window's group index is the mean over members with data then."""
     closes_full = get_close_matrix()
     # Snap the anchor to the last trading day at/before the requested end date so
     # the window bounds never reach past available data (no lookahead).
@@ -328,43 +389,57 @@ def compute_sector_leaders(group_level: str, period_days: int, window_label: str
         end = on_or_before.max() if len(on_or_before) else closes_full.index.min()
     start = end - pd.Timedelta(days=period_days)
 
-    offset = LEADER_WINDOWS[window_label][1]
-    bounds = [end]
-    while True:
-        prev = bounds[-1] - offset
-        if prev < start - pd.Timedelta(days=5):  # small tolerance so e.g. 4x 3mo fits "1 year"
-            break
-        bounds.append(prev)
-    bounds = pd.DatetimeIndex(sorted(bounds))
+    window_offset = LEADER_WINDOWS[window_label][1]
+    step_offset = LEADER_STEPS[step_label] if step_label else window_offset
 
-    # Keep a ~2-week buffer before the first bound so ffill can reach the last
-    # trading day at/before it (the bound itself is rarely a trading day).
-    closes = closes_full.loc[closes_full.index >= bounds[0] - pd.Timedelta(days=14)]
-    filled = closes.ffill()
-    # Leading NaNs (pre-listing) survive ffill, so a stock has no value at
-    # bounds before it listed and simply drops out of those windows.
-    sampled = filled.reindex(bounds, method="ffill")
-    wret = sampled.pct_change(fill_method=None).iloc[1:]
+    # Windows end on/before `end`, each `window_offset` long and fully inside the
+    # lookback; their end dates step back by `step_offset` (= the window itself
+    # in non-overlapping mode, giving exactly back-to-back windows).
+    windows = []  # (start, end) pairs
+    we = end
+    while True:
+        ws = we - window_offset
+        if ws < start - pd.Timedelta(days=5):  # tolerance so e.g. 4x 3mo fits "1 year"
+            break
+        windows.append((ws, we))
+        we = we - step_offset
+    windows.reverse()  # oldest first
+    win_starts = [ws for ws, _ in windows]
+    win_ends = [we for _, we in windows]
+    period_start = min(win_starts)
+
+    # Sample every bound off a forward-filled matrix (bounds are rarely trading
+    # days). Keep a buffer before the first bound so ffill can reach it. Leading
+    # NaNs (pre-listing) survive, so a stock has no value at bounds before it
+    # listed and simply drops out of those windows.
+    filled = closes_full.loc[closes_full.index >= period_start - pd.Timedelta(days=14)].ffill()
+    start_vals = filled.reindex(win_starts, method="ffill").to_numpy()
+    end_vals = filled.reindex(win_ends, method="ffill").to_numpy()
+    R = pd.DataFrame(end_vals / start_vals - 1, columns=filled.columns)  # windows x symbols
 
     sym2grp = get_sector_map().set_index("symbol")[group_level]
-    cols = [c for c in wret.columns if c in sym2grp.index]
-    wret = wret[cols]
+    cols = [c for c in R.columns if c in sym2grp.index]
+    R = R[cols]
     groups = sym2grp[cols]
 
-    grp_mean = wret.T.groupby(groups.values).mean().T    # rows: windows, cols: groups
-    delta = wret - grp_mean[groups.values].to_numpy()    # same shape as wret
+    grp_mean = R.T.groupby(groups.values).mean().T       # windows x groups
+    delta = R - grp_mean[groups.values].to_numpy()       # windows x symbols
 
     valid = delta.notna()
     beats = ((delta > 0) & valid).sum()
     n_windows = valid.sum()
 
-    # Period return anchored to the window bounds: full-history stocks use the
-    # close as of the first bound (so it compounds exactly from the window
-    # returns); later listings fall back to their first traded close in-period.
-    in_period = closes_full.loc[closes_full.index >= bounds[0], cols]
-    first_close = sampled[cols].iloc[0].fillna(in_period.bfill().iloc[0])
-    last_close = sampled[cols].iloc[-1]
-    grp_total = ((1 + grp_mean).prod() - 1) * 100        # compounded group window returns
+    # Full-period return over the whole lookback, independent of windowing -- so
+    # the group total is a clean equal-weight peer return that still works when
+    # windows overlap (you can't compound overlapping window returns). Full-
+    # history stocks anchor to the close at the period start; later listings fall
+    # back to their first traded close in-period.
+    raw_first = filled.reindex([period_start], method="ffill")[cols].iloc[0]
+    in_period = closes_full.loc[closes_full.index >= period_start, cols]
+    period_first = raw_first.fillna(in_period.bfill().iloc[0])
+    period_last = filled.reindex([end], method="ffill")[cols].iloc[0]
+    period_return = (period_last / period_first - 1) * 100
+    grp_period = period_return.groupby(groups).mean()
 
     stats = pd.DataFrame({
         "group": groups,
@@ -373,14 +448,43 @@ def compute_sector_leaders(group_level: str, period_days: int, window_label: str
         "windows": n_windows,
         "consistency_pct": beats.div(n_windows.where(n_windows > 0)) * 100,
         "avg_window_delta_pp": delta.mean() * 100,
-        "period_return_pct": (last_close / first_close - 1) * 100,
-        "group_return_pct": groups.map(grp_total),
-        "full_history": sampled[cols].iloc[0].notna(),
+        "median_window_delta_pp": delta.median() * 100,
+        "worst_window_delta_pp": delta.min() * 100,
+        "period_return_pct": period_return,
+        "group_return_pct": groups.map(grp_period),
+        "full_history": raw_first.notna(),
     })
     stats["delta_total_pp"] = stats["period_return_pct"] - stats["group_return_pct"]
     stats.index.name = "symbol"
-    return {"stats": stats.reset_index(), "n_bounds": len(bounds),
-            "start": bounds[0], "end": bounds[-1]}
+
+    # Aggregate ranking: each group vs the broad market (equal-weighted whole
+    # classified universe), reusing the same windows. This answers "which group
+    # led at the selected level" -- one level up from the stock leaderboard,
+    # where the benchmark is the market instead of the group.
+    market_wret = R.mean(axis=1)                          # per window, all stocks
+    gdelta = grp_mean.sub(market_wret, axis=0)            # windows x groups
+    gvalid = gdelta.notna()
+    gbeats = ((gdelta > 0) & gvalid).sum()
+    gwin = gvalid.sum()
+    market_return = period_return.mean()
+    group_stats = pd.DataFrame({
+        "members": groups.value_counts(),
+        "beaten": gbeats,
+        "windows": gwin,
+        "consistency_pct": gbeats.div(gwin.where(gwin > 0)) * 100,
+        "avg_window_delta_pp": gdelta.mean() * 100,
+        "median_window_delta_pp": gdelta.median() * 100,
+        "worst_window_delta_pp": gdelta.min() * 100,
+        "group_return_pct": grp_period,
+        "market_return_pct": market_return,
+    })
+    group_stats["delta_vs_market_pp"] = group_stats["group_return_pct"] - market_return
+    group_stats.index.name = "group"
+
+    return {"stats": stats.reset_index(), "group_stats": group_stats.reset_index(),
+            "n_windows": len(windows), "start": period_start, "end": end,
+            "market_return_pct": market_return,
+            "mode": "rolling" if step_label else "non-overlapping", "step": step_label}
 
 
 @st.cache_data
@@ -549,16 +653,17 @@ st.title("NSE Market Data")
 
 symbols = get_symbols()
 
-# --- Sidebar: stage classifier settings, shared across Charts / Screener / Backtest ---
 SECTIONS = ["Charts", "Stage screener", "Strategy backtest", "Signal backtest", "Sector leaders", "Query / Tables"]
 
-with st.sidebar:
-    section = st.radio("Go to", SECTIONS, key="nav_section")
+# Section nav lives at the top of the main area (not the sidebar) so it's one
+# tap on mobile without opening the settings drawer, and it works identically on
+# desktop. Defined before the sidebar block so the settings accordions below can
+# still key their auto-open off the selected section.
+section = st.selectbox("Section", SECTIONS, key="nav_section", label_visibility="collapsed")
 
+with st.sidebar:
     # Which strategy's settings are relevant to the current section. The
-    # relevant accordion opens, the other stays collapsed. (Streamlit tabs
-    # switch client-side and never reach the server, so navigation lives here
-    # in the left pane instead.)
+    # relevant accordion opens, the other stays collapsed.
     stage_relevant = section in {"Charts", "Stage screener", "Strategy backtest"}
     signal_relevant = section in {"Charts", "Signal backtest"}
 
@@ -1095,11 +1200,19 @@ if section == "Signal backtest":
 
 if section == "Sector leaders":
     st.caption(
-        "Pure price action: the lookback period is split into non-overlapping windows "
-        "(counting back from the end date), each stock's window return is compared to its "
-        "**equal-weighted peer-group index**, and stocks are ranked by how *consistently* they "
-        "beat their group — not just by total return. A stock that beat its sector in 7 of 8 "
-        "quarters is a leadership candidate worth studying; one big spike isn't."
+        "Pure price action: the lookback period is split into windows (counting back from the "
+        "end date), each stock's window return is compared to its **equal-weighted peer-group "
+        "index**, and stocks are ranked by how *consistently* they beat their group — not just by "
+        "total return. A stock that beat its sector in most windows is a leadership candidate "
+        "worth studying; one big spike isn't."
+    )
+
+    leader_view = st.segmented_control(
+        "Rank", ["Aggregate groups", "Individual stocks"], default="Aggregate groups",
+        key="leader_view",
+        help="**Aggregate groups** ranks each group at the chosen level (which sector / industry "
+        "led) against the broad market. **Individual stocks** ranks stocks against their own "
+        "group. Either way, the drill-down below lets you open one group and see its members.",
     )
 
     date_lo, date_hi = get_price_date_range()
@@ -1133,6 +1246,35 @@ if section == "Sector leaders":
             help="Only show stocks that beat their group in at least this share of windows.",
         )
     leader_end_ts = pd.Timestamp(leader_end)
+
+    sc1, sc2, sc3 = st.columns([1.3, 1.3, 2.4])
+    with sc1:
+        scan_mode = st.segmented_control(
+            "Scan mode", ["Rolling", "Non-overlapping"], default="Rolling", key="leader_scan_mode",
+            help="**Rolling** slides the window forward in small steps so it overlaps — many "
+            "windows, robust to where boundaries fall, best for *identifying* durable leaders "
+            "(but overlap means the hit rate is a stable estimate, not independent trials). "
+            "**Non-overlapping** uses back-to-back windows — few but statistically independent, "
+            "a good cross-check.",
+        )
+    with sc2:
+        if scan_mode == "Rolling":
+            step_label = st.selectbox(
+                "Rolling step", list(LEADER_STEPS), index=2, key="leader_step",
+                help="How far each window's end date slides. Smaller steps = more windows and a "
+                "smoother, more phase-robust consistency estimate.",
+            )
+        else:
+            step_label = None
+            st.caption(":material/info: Back-to-back windows: independent samples, but few and "
+                       "sensitive to the exact end date.")
+    with sc3:
+        st.caption(
+            "Rolling scans the whole period for every window of the chosen length that ends "
+            "on/before the end date, so a leader isn't missed just because it fell between "
+            "fixed quarter boundaries. Set mode to Non-overlapping to reproduce the old "
+            "floor(period ÷ window) behaviour."
+        )
 
     mcap_df = get_mcap_map()
     has_mcap = not mcap_df.empty
@@ -1191,70 +1333,141 @@ if section == "Sector leaders":
     if not st.session_state.get("leaders_active"):
         st.info("Click **Build leaderboard** to load the price universe and rank the stocks (first load takes a minute; instant after that).")
     else:
-        res = compute_sector_leaders(leader_level, period_days, leader_window, leader_end_ts)
+        res = compute_sector_leaders(leader_level, period_days, leader_window, leader_end_ts, step_label)
         stats = res["stats"]
-        n_windows_max = res["n_bounds"] - 1
+        group_stats = res["group_stats"]
+        mode_txt = (f"rolling ({res['step']} step, overlapping)" if res["mode"] == "rolling"
+                    else "non-overlapping")
+        subj = ("each group beat the broad market" if leader_view == "Aggregate groups"
+                else "each stock beat its group")
         st.caption(
-            f"{n_windows_max} non-overlapping {leader_window} windows from "
-            f"{res['start'].date()} to {res['end'].date()}."
+            f"{res['n_windows']} {mode_txt} {leader_window} windows from "
+            f"{res['start'].date()} to {res['end'].date()}. Consistency = share of these "
+            f"windows {subj}."
+            + (" Overlapping windows share days, so read the % as a robust estimate, not "
+               "independent trials." if res["mode"] == "rolling" else "")
         )
 
         if has_mcap:
             stats = stats.merge(mcap_df, on="symbol", how="left")
             stats["segment"] = stats["mcap_cr"].map(mcap_segment)
 
-        filtered = stats[stats["peers"] >= min_peers]
-        if full_history_only:
-            filtered = filtered[filtered["full_history"]]
-        if has_mcap and mcap_range is not None and (
-                mcap_range[0] > mcap_stops[0] or mcap_range[1] < mcap_stops[-1]):
-            # A narrowed band excludes stocks with no mcap (NaN fails between);
-            # the full range leaves everything in, unknowns included.
-            filtered = filtered[filtered["mcap_cr"].between(*mcap_range)]
-        filtered = filtered[filtered["consistency_pct"] >= min_consistency]
-        filtered = filtered.sort_values(
-            ["consistency_pct", "avg_window_delta_pp"], ascending=False
-        )
-        if top_n_choice != "All stocks":
-            n = 3 if "3" in top_n_choice else 5
-            filtered = filtered.groupby("group", sort=False).head(n)
+        level_label = leader_level.replace("_", " ")
+        if leader_view == "Aggregate groups":
+            best_member = (stats[stats["full_history"]]
+                           .sort_values("consistency_pct", ascending=False)
+                           .groupby("group")["symbol"].first())
+            # Show every group ranked (min. members still drops trivially small
+            # ones). The consistency threshold is a stock-screening tool for the
+            # 1000+ name universe; with only a couple dozen groups the point is
+            # to see the whole ranking, so it isn't applied here.
+            gdf = group_stats[group_stats["members"] >= min_peers].sort_values(
+                ["consistency_pct", "avg_window_delta_pp"], ascending=False).copy()
+            gdf["top_member"] = gdf["group"].map(best_member)
+            gdf["record"] = gdf["beaten"].astype(str) + "/" + gdf["windows"].astype(str)
+            beat_bar = int((gdf["consistency_pct"] > 50).sum())
+            st.write(f"**{len(gdf)} {level_label}s ranked** by consistency of beating the broad "
+                     f"market ({beat_bar} beat it in over half the windows; market return over "
+                     f"the period {res['market_return_pct']:+.1f}%)")
+            if gdf.empty:
+                st.caption("No groups have enough members — lower **Min. stocks in group**.")
+            else:
+                gcols = ["group", "members", "record", "consistency_pct", "avg_window_delta_pp",
+                         "median_window_delta_pp", "worst_window_delta_pp", "group_return_pct",
+                         "delta_vs_market_pp", "top_member"]
+                st.dataframe(
+                    gdf[gcols], width="stretch", height=460, hide_index=True,
+                    column_config={
+                        "group": st.column_config.TextColumn(level_label),
+                        "members": st.column_config.NumberColumn("members", format="%d"),
+                        "record": st.column_config.TextColumn(
+                            "beat market", help="Windows the group's index beat the broad-market index / windows measured"),
+                        "consistency_pct": st.column_config.ProgressColumn(
+                            "consistency", format="%.0f%%", min_value=0, max_value=100),
+                        "avg_window_delta_pp": st.column_config.NumberColumn(
+                            "avg delta / window", format="%+.1f pp",
+                            help="Average (group − market) return per window, in percentage points"),
+                        "median_window_delta_pp": st.column_config.NumberColumn(
+                            "median delta / window", format="%+.1f pp"),
+                        "worst_window_delta_pp": st.column_config.NumberColumn(
+                            "worst window", format="%+.1f pp",
+                            help="Largest single-window shortfall vs the market — the group's downside tail"),
+                        "group_return_pct": st.column_config.NumberColumn(
+                            f"return {leader_period}", format="%+.1f%%"),
+                        "delta_vs_market_pp": st.column_config.NumberColumn(
+                            "delta vs market", format="%+.1f pp",
+                            help="Full-period group return minus the broad-market return"),
+                        "top_member": st.column_config.TextColumn(
+                            "top member", help="Most-consistent full-history stock in the group — its best individual leader"),
+                    },
+                )
+                st.download_button(
+                    "Download group ranking as CSV", gdf[gcols].to_csv(index=False),
+                    file_name="sector_leaders_groups.csv", mime="text/csv",
+                )
+                st.caption(f"Switch **Rank** to *Individual stocks* to rank stocks within groups, "
+                           f"or use the drill-down below to open one {level_label}.")
 
-        st.write(f"**{len(filtered)} consistent outperformers** (of {len(stats)} stocks scored)")
-        if filtered.empty:
-            st.caption("Nothing matches — lower the consistency bar or relax the filters.")
-        else:
-            display = filtered.copy()
-            display["record"] = display["beaten"].astype(str) + "/" + display["windows"].astype(str)
-            cols = ["symbol", "group", "record", "consistency_pct", "avg_window_delta_pp",
-                    "period_return_pct", "group_return_pct", "delta_total_pp", "peers"]
-            if has_mcap:
-                cols[2:2] = ["segment", "mcap_cr"]
-            st.dataframe(
-                display[cols],
-                width="stretch", height=420, hide_index=True,
-                column_config={
-                    "group": st.column_config.TextColumn(leader_level.replace("_", " ")),
-                    "record": st.column_config.TextColumn(
-                        "beat group", help="Windows where the stock's return beat its group index / windows it traded in"),
-                    "consistency_pct": st.column_config.ProgressColumn(
-                        "consistency", format="%.0f%%", min_value=0, max_value=100),
-                    "avg_window_delta_pp": st.column_config.NumberColumn(
-                        "avg delta / window", format="%+.1f pp",
-                        help="Average (stock − group) return per window, in percentage points"),
-                    "period_return_pct": st.column_config.NumberColumn(
-                        f"return {leader_period}", format="%+.1f%%"),
-                    "group_return_pct": st.column_config.NumberColumn(
-                        "group return", format="%+.1f%%"),
-                    "delta_total_pp": st.column_config.NumberColumn(
-                        "delta vs group", format="%+.1f pp",
-                        help="Full-period stock return minus full-period group return"),
-                    "mcap_cr": st.column_config.NumberColumn("mcap (₹ cr)", format="%.0f"),
-                },
+        if leader_view == "Individual stocks":
+            filtered = stats[stats["peers"] >= min_peers]
+            if full_history_only:
+                filtered = filtered[filtered["full_history"]]
+            if has_mcap and mcap_range is not None and (
+                    mcap_range[0] > mcap_stops[0] or mcap_range[1] < mcap_stops[-1]):
+                # A narrowed band excludes stocks with no mcap (NaN fails between);
+                # the full range leaves everything in, unknowns included.
+                filtered = filtered[filtered["mcap_cr"].between(*mcap_range)]
+            filtered = filtered[filtered["consistency_pct"] >= min_consistency]
+            filtered = filtered.sort_values(
+                ["consistency_pct", "avg_window_delta_pp"], ascending=False
             )
-            st.download_button(
-                "Download leaderboard as CSV", display[cols].to_csv(index=False),
-                file_name="sector_leaders.csv", mime="text/csv",
-            )
+            if top_n_choice != "All stocks":
+                n = 3 if "3" in top_n_choice else 5
+                filtered = filtered.groupby("group", sort=False).head(n)
+
+            st.write(f"**{len(filtered)} consistent outperformers** (of {len(stats)} stocks scored)")
+            if filtered.empty:
+                st.caption("Nothing matches — lower the consistency bar or relax the filters.")
+            else:
+                display = filtered.copy()
+                display["record"] = display["beaten"].astype(str) + "/" + display["windows"].astype(str)
+                cols = ["symbol", "group", "record", "consistency_pct", "avg_window_delta_pp",
+                        "median_window_delta_pp", "worst_window_delta_pp",
+                        "period_return_pct", "group_return_pct", "delta_total_pp", "peers"]
+                if has_mcap:
+                    cols[2:2] = ["segment", "mcap_cr"]
+                st.dataframe(
+                    display[cols],
+                    width="stretch", height=420, hide_index=True,
+                    column_config={
+                        "group": st.column_config.TextColumn(leader_level.replace("_", " ")),
+                        "record": st.column_config.TextColumn(
+                            "beat group", help="Windows where the stock's return beat its group index / windows it traded in"),
+                        "consistency_pct": st.column_config.ProgressColumn(
+                            "consistency", format="%.0f%%", min_value=0, max_value=100),
+                        "avg_window_delta_pp": st.column_config.NumberColumn(
+                            "avg delta / window", format="%+.1f pp",
+                            help="Average (stock − group) return per window, in percentage points"),
+                        "median_window_delta_pp": st.column_config.NumberColumn(
+                            "median delta / window", format="%+.1f pp",
+                            help="Median (stock − group) return per window — less swayed by one outlier window than the average"),
+                        "worst_window_delta_pp": st.column_config.NumberColumn(
+                            "worst window", format="%+.1f pp",
+                            help="Largest single-window shortfall vs the group — the downside tail. A steady leader rarely lags badly in any window"),
+                        "period_return_pct": st.column_config.NumberColumn(
+                            f"return {leader_period}", format="%+.1f%%"),
+                        "group_return_pct": st.column_config.NumberColumn(
+                            "group return", format="%+.1f%%"),
+                        "delta_total_pp": st.column_config.NumberColumn(
+                            "delta vs group", format="%+.1f pp",
+                            help="Full-period stock return minus full-period group return"),
+                        "mcap_cr": st.column_config.NumberColumn("mcap (₹ cr)", format="%.0f"),
+                    },
+                )
+                st.download_button(
+                    "Download leaderboard as CSV", display[cols].to_csv(index=False),
+                    file_name="sector_leaders.csv", mime="text/csv",
+                )
 
         st.divider()
         st.subheader(":material/travel_explore: Group drill-down")
