@@ -19,6 +19,9 @@ Tabs:
     Query / Tables     - run arbitrary SQL against the DuckDB file
 """
 
+import re
+from datetime import datetime, timezone
+
 import duckdb
 import pandas as pd
 import plotly.graph_objects as go
@@ -360,6 +363,294 @@ def format_mcap_cr(v: float) -> str:
     return f"{v:g} cr"
 
 
+# --- Fundamentals: per-company statement viewer, mirroring screener.in's own
+# page layout so the scrape can be visually spot-checked against the source. ---
+
+# Row order exactly as it appears on screener.in's company page (verified by
+# fetching a live page this session) -- not alphabetical/discovery order, so
+# the table reads the same top-to-bottom as the real page for easy comparison.
+FUNDAMENTALS_METRIC_ORDER = {
+    "profit_loss": ["Sales", "Expenses", "Operating Profit", "OPM %", "Other Income",
+                     "Interest", "Depreciation", "Profit before tax", "Tax %", "Net Profit",
+                     "EPS in Rs", "Dividend Payout %"],
+    "quarters": ["Sales", "Expenses", "Operating Profit", "OPM %", "Other Income",
+                  "Interest", "Depreciation", "Profit before tax", "Tax %", "Net Profit",
+                  "EPS in Rs"],
+    "balance_sheet": ["Equity Capital", "Reserves", "Borrowings", "Other Liabilities",
+                       "Total Liabilities", "Fixed Assets", "CWIP", "Investments",
+                       "Other Assets", "Total Assets"],
+    "cash_flow": ["Cash from Operating Activity", "Cash from Investing Activity",
+                   "Cash from Financing Activity", "Net Cash Flow", "Free Cash Flow", "CFO/OP"],
+    "ratios": ["Debtor Days", "Inventory Days", "Days Payable", "Cash Conversion Cycle",
+                "Working Capital Days", "ROCE %"],
+}
+
+FUNDAMENTALS_TABS = [
+    ("quarters", "Quarterly results"), ("profit_loss", "Profit & loss"),
+    ("balance_sheet", "Balance sheet"), ("cash_flow", "Cash flow"), ("ratios", "Ratios"),
+]
+
+
+@st.cache_data
+def get_fundamentals_raw(symbol: str) -> pd.DataFrame:
+    con = get_connection()
+    return con.execute(
+        "SELECT statement, period_type, metric, period_end, value, unit "
+        "FROM fundamentals_raw WHERE symbol = ? ORDER BY period_end",
+        [symbol],
+    ).df()
+
+
+@st.cache_data
+def get_fundamentals_scrape_info(symbol: str):
+    con = get_connection()
+    row = con.execute(
+        "SELECT statement_basis, status, scraped_at FROM fundamentals_scrape_log WHERE symbol = ?",
+        [symbol],
+    ).fetchone()
+    return row  # (basis, status, scraped_at) or None if never scraped
+
+
+def format_fundamentals_value(value: float, unit: str) -> str:
+    if pd.isna(value):
+        return ""
+    if unit == "pct":
+        return f"{value:.0f}%"
+    if unit == "rs_per_share":
+        return f"{value:.2f}"
+    if unit == "days":
+        return f"{value:.0f}"
+    return f"{value:,.0f}"  # 'cr'
+
+
+def pivot_fundamentals_statement(raw: pd.DataFrame, statement: str):
+    """metric-as-row / period-as-column tables for one statement, ordered to
+    match screener.in's own layout. Periods run oldest -> newest left to right.
+    Returns (display, values): display holds formatted strings for reading;
+    values holds the raw floats (NaN where blank), same shape/index/columns --
+    used for range-selection stats and to resolve growth-rate projections."""
+    slice_df = raw[raw["statement"] == statement]
+    if slice_df.empty:
+        return pd.DataFrame(), pd.DataFrame()
+    formatted = slice_df.assign(
+        display=slice_df.apply(lambda r: format_fundamentals_value(r["value"], r["unit"]), axis=1),
+        period_label=pd.to_datetime(slice_df["period_end"]).dt.strftime("%b %Y"),
+    )
+    wide_display = formatted.pivot_table(index="metric", columns="period_label", values="display", aggfunc="first")
+    wide_values = formatted.pivot_table(index="metric", columns="period_label", values="value", aggfunc="first")
+    # Column order: chronological, not alphabetical (pivot_table sorts labels
+    # alphabetically by default, which scrambles "Mar" before "Jun" etc.)
+    period_order = (
+        formatted[["period_label", "period_end"]].drop_duplicates()
+        .sort_values("period_end")["period_label"]
+    )
+    cols = [p for p in period_order if p in wide_display.columns]
+    wide_display = wide_display.reindex(columns=cols)
+    wide_values = wide_values.reindex(columns=cols)
+    # Row order: screener's own order first, then anything unexpected appended
+    # (e.g. a company-specific line item) rather than silently dropped.
+    canonical = FUNDAMENTALS_METRIC_ORDER.get(statement, [])
+    ordered_rows = [m for m in canonical if m in wide_display.index] + \
+                   [m for m in wide_display.index if m not in canonical]
+    return wide_display.reindex(index=ordered_rows).fillna(""), wide_values.reindex(index=ordered_rows)
+
+
+# --- User projections & notes: a separate local DuckDB file, deliberately not
+# nse_market_data.duckdb. Keeps the scraped data read-only/untouched, avoids any
+# lock contention with the app's existing read-only connection, and makes these
+# personal annotations trivially "local" -- just another file the user owns,
+# independent of the scrape pipeline. Only Profit & Loss and Ratios are
+# projectable (that's where Sales/OPM %/Net Profit/ROCE % live); the other three
+# statements stay historical-only. ---
+
+PROJECTIONS_DB_FILE = "fundamentals_user_data.duckdb"
+PROJECTION_STATEMENTS = {"profit_loss", "ratios"}
+PROJECTION_HORIZONS = {"3 years": 3, "5 years": 5}
+GROWTH_PCT_RE = re.compile(r"^([+-]?\d+(?:\.\d+)?)\s*%$")
+
+
+@st.cache_resource
+def get_user_db_connection() -> duckdb.DuckDBPyConnection:
+    con = duckdb.connect(PROJECTIONS_DB_FILE)
+    # One-time migration: projections originally stored a pre-resolved `value
+    # DOUBLE`; growth-rate projections need the raw typed text instead ('15%'
+    # vs a pre-computed number). Safe to drop and recreate -- this table has
+    # never held real user data outside this same session's own testing.
+    try:
+        existing_cols = {r[0] for r in con.execute("DESCRIBE projections").fetchall()}
+    except duckdb.Error:
+        existing_cols = set()
+    if existing_cols and "input_raw" not in existing_cols:
+        con.execute("DROP TABLE projections")
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS projections (
+            symbol      VARCHAR,
+            statement   VARCHAR,
+            metric      VARCHAR,
+            period_end  DATE,
+            input_raw   VARCHAR,
+            updated_at  TIMESTAMP,
+            PRIMARY KEY (symbol, statement, metric, period_end)
+        )
+    """)
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS notes (
+            symbol      VARCHAR PRIMARY KEY,
+            note        VARCHAR,
+            updated_at  TIMESTAMP
+        )
+    """)
+    return con
+
+
+@st.cache_data
+def get_projections(symbol: str) -> pd.DataFrame:
+    con = get_user_db_connection()
+    return con.execute(
+        "SELECT statement, metric, period_end, input_raw FROM projections WHERE symbol = ?",
+        [symbol],
+    ).df()
+
+
+def save_projection_cell(symbol: str, statement: str, metric: str, period_end, input_raw: str):
+    """Upserts one cell's raw assumption ('15%' or an absolute number); a blank
+    input_raw deletes it instead of storing an empty string, so a cleared cell
+    truly falls back to 'nothing projected' rather than an empty-but-present row."""
+    con = get_user_db_connection()
+    if input_raw is None or str(input_raw).strip() == "":
+        con.execute(
+            "DELETE FROM projections WHERE symbol=? AND statement=? AND metric=? AND period_end=?",
+            [symbol, statement, metric, period_end],
+        )
+    else:
+        con.execute(
+            "INSERT OR REPLACE INTO projections VALUES (?, ?, ?, ?, ?, ?)",
+            [symbol, statement, metric, period_end, input_raw.strip(), datetime.now(timezone.utc)],
+        )
+    get_projections.clear()
+
+
+@st.cache_data
+def get_note(symbol: str) -> str:
+    con = get_user_db_connection()
+    row = con.execute("SELECT note FROM notes WHERE symbol = ?", [symbol]).fetchone()
+    return row[0] if row else ""
+
+
+def save_note(symbol: str, text: str):
+    con = get_user_db_connection()
+    con.execute("INSERT OR REPLACE INTO notes VALUES (?, ?, ?)", [symbol, text, datetime.now(timezone.utc)])
+    get_note.clear()
+
+
+def future_period_ends(last_period_end, n_years: int) -> list:
+    last = pd.Timestamp(last_period_end)
+    return [(last + pd.DateOffset(years=i)).date() for i in range(1, n_years + 1)]
+
+
+def infer_unit_from_metric_name(metric: str) -> str:
+    """Fallback unit guess for a metric with zero historical rows for this
+    company (so its unit can't be read off the scraped data) but the user still
+    wants to project it. Mirrors scrape_fundamentals_history.py's infer_unit()."""
+    if metric.endswith("%"):
+        return "pct"
+    if "Days" in metric:
+        return "days"
+    if metric == "EPS in Rs":
+        return "rs_per_share"
+    return "cr"
+
+
+def resolve_projection_chain(last_actual, future_inputs: list) -> list:
+    """future_inputs: [(period_end, input_raw), ...] in chronological order.
+    Returns [(period_end, resolved_value_or_None), ...].
+
+    input_raw is either a growth rate ('15%', '-5%' -- proportional growth on
+    whatever the PREVIOUS period resolved to, whether that's the last actual or
+    a prior projection, same idea as dragging '=B5*1.15' across a row in
+    Excel), an absolute number ('16500', restarts the chain from here), or
+    blank (breaks the chain -- resolves to None, and so does every subsequent
+    growth-rate cell until an absolute number restarts it).
+
+    One deliberate simplification: '15%' always means proportional growth on
+    the raw number, even for already-percentage rows like OPM % (20 -> 23, not
+    20 -> 35 percentage points) -- applied uniformly rather than having two
+    different meanings depending on the row's unit."""
+    prev = last_actual
+    out = []
+    for period_end, input_raw in future_inputs:
+        text = "" if input_raw is None or (isinstance(input_raw, float) and pd.isna(input_raw)) else str(input_raw).strip()
+        if not text:
+            resolved = None
+        else:
+            pct_match = GROWTH_PCT_RE.match(text)
+            if pct_match:
+                resolved = prev * (1 + float(pct_match.group(1)) / 100) if prev is not None else None
+            else:
+                try:
+                    resolved = float(text.replace(",", ""))
+                except ValueError:
+                    resolved = None
+        out.append((period_end, resolved))
+        prev = resolved
+    return out
+
+
+def pivot_fundamentals_with_projections(raw: pd.DataFrame, projections: pd.DataFrame,
+                                         statement: str, horizon_years: int):
+    """Like pivot_fundamentals_statement, but appends `horizon_years` extra
+    future-period columns (labeled e.g. 'Mar 2027E') resolved via
+    resolve_projection_chain from the user's saved raw assumptions. The table
+    always shows the RESOLVED value (Excel-style: the cell shows the computed
+    result; the raw formula is what you see/edit when you select that cell).
+
+    Returns (display, values, future_cols, period_end_by_col, input_raw_by_cell):
+    display/values mirror pivot_fundamentals_statement's shape (now including
+    the future columns); input_raw_by_cell maps (metric, future_col_label) ->
+    the raw text so a selected cell's assumption editor can prefill correctly."""
+    historical_display, historical_values = pivot_fundamentals_statement(raw, statement)
+    slice_df = raw[raw["statement"] == statement]
+    if slice_df.empty and historical_display.empty:
+        return pd.DataFrame(), pd.DataFrame(), [], {}, {}
+
+    canonical = FUNDAMENTALS_METRIC_ORDER.get(statement, [])
+    metrics = list(historical_display.index) if not historical_display.empty else canonical
+    last_period = slice_df["period_end"].max() if not slice_df.empty else None
+
+    future_ends = future_period_ends(last_period, horizon_years) if last_period is not None else []
+    future_cols = [pd.Timestamp(d).strftime("%b %Y") + "E" for d in future_ends]
+    period_end_by_col = dict(zip(future_cols, future_ends))
+
+    proj_slice = projections[projections["statement"] == statement] if not projections.empty else projections
+    input_by_metric_period = {}
+    if proj_slice is not None and not proj_slice.empty:
+        for _, r in proj_slice.iterrows():
+            input_by_metric_period[(r["metric"], pd.Timestamp(r["period_end"]).date())] = r["input_raw"]
+
+    units_by_metric = (
+        raw[raw["statement"] == statement].drop_duplicates("metric").set_index("metric")["unit"].to_dict()
+    )
+
+    future_values = pd.DataFrame(index=metrics, columns=future_cols, dtype="float64")
+    future_display = pd.DataFrame(index=metrics, columns=future_cols, dtype="object")
+    input_raw_by_cell = {}
+
+    for metric in metrics:
+        non_null = historical_values.loc[metric].dropna() if metric in historical_values.index else pd.Series(dtype="float64")
+        last_actual = non_null.iloc[-1] if not non_null.empty else None
+        chain_inputs = [(pe, input_by_metric_period.get((metric, pe))) for pe in future_ends]
+        resolved = resolve_projection_chain(last_actual, chain_inputs)
+        unit = units_by_metric.get(metric) or infer_unit_from_metric_name(metric)
+        for col, (pe, val) in zip(future_cols, resolved):
+            future_values.loc[metric, col] = val
+            future_display.loc[metric, col] = format_fundamentals_value(val, unit) if val is not None else ""
+            input_raw_by_cell[(metric, col)] = input_by_metric_period.get((metric, pe), "") or ""
+
+    display = pd.concat([historical_display.reindex(index=metrics).fillna(""), future_display], axis=1)
+    values = pd.concat([historical_values.reindex(index=metrics), future_values], axis=1)
+    return display, values, future_cols, period_end_by_col, input_raw_by_cell
+
+
 @st.cache_data(show_spinner="Computing window returns vs peer-group index...")
 def compute_sector_leaders(group_level: str, period_days: int, window_label: str,
                             end_date: pd.Timestamp = None, step_label: str = None) -> dict:
@@ -512,6 +803,138 @@ def get_group_leader_chart(group_level: str, group_name: str, top_symbols: tuple
     return out
 
 
+# --- Sector fundamentals: year-by-year sector aggregates (revenue, profit, ROCE,
+# ROE, PE) to spot years a sector's fundamentals accelerated, not just its price. ---
+
+@st.cache_data(show_spinner="Aggregating sector fundamentals across years...")
+def get_sector_fundamentals_raw(group_level: str) -> pd.DataFrame:
+    """Per-company-per-year fundamentals joined to sector classification and an
+    as-of share price (last close on/before the result's `available_date`, so no
+    lookahead) for PE and the market-cap-derived ratios below. Sales growth comes
+    straight from the scrape (screener's own YoY calc); profit growth is computed
+    here the same way."""
+    con = get_connection()
+    query = f"""
+        WITH roe AS (
+            SELECT symbol, period_end, value AS roe_pct
+            FROM fundamentals_raw WHERE statement = 'ratios' AND metric = 'ROE %'
+        ),
+        borrow AS (
+            SELECT symbol, period_end, MAX(value) AS borrowings_cr
+            FROM fundamentals_raw
+            WHERE statement = 'balance_sheet' AND metric IN ('Borrowing', 'Borrowings')
+            GROUP BY symbol, period_end
+        ),
+        assets AS (
+            SELECT symbol, period_end, value AS total_assets_cr
+            FROM fundamentals_raw WHERE statement = 'balance_sheet' AND metric = 'Total Assets'
+        ),
+        cfo AS (
+            SELECT symbol, period_end, value AS cfo_cr
+            FROM fundamentals_raw WHERE statement = 'cash_flow' AND metric = 'Cash from Operating Activity'
+        )
+        SELECT fa.symbol, im.{group_level} AS group_name, fa.period_end,
+               fa.sales_cr, fa.net_profit_cr, fa.eps_rs, fa.roce_pct, fa.opm_pct,
+               fa.sales_growth_pct, roe.roe_pct, dp.close AS close_price,
+               borrow.borrowings_cr, assets.total_assets_cr, cfo.cfo_cr
+        FROM fundamentals_annual fa
+        JOIN instruments im ON im.tradingsymbol = fa.symbol
+        LEFT JOIN roe ON roe.symbol = fa.symbol AND roe.period_end = fa.period_end
+        LEFT JOIN borrow ON borrow.symbol = fa.symbol AND borrow.period_end = fa.period_end
+        LEFT JOIN assets ON assets.symbol = fa.symbol AND assets.period_end = fa.period_end
+        LEFT JOIN cfo ON cfo.symbol = fa.symbol AND cfo.period_end = fa.period_end
+        ASOF LEFT JOIN daily_prices dp
+            ON dp.tradingsymbol = fa.symbol AND dp.date <= fa.available_date
+        WHERE im.{group_level} IS NOT NULL AND fa.sales_cr IS NOT NULL
+    """
+    df = con.execute(query).df()
+    df["period_end"] = pd.to_datetime(df["period_end"])
+    df["fiscal_year"] = df["period_end"].dt.year
+    df = df.sort_values(["symbol", "period_end"])
+    df["profit_growth_pct"] = df.groupby("symbol")["net_profit_cr"].pct_change() * 100
+    # A near-zero prior-year base makes plain pct-change blow up to +/-1000s%,
+    # which would swamp any real acceleration signal -- drop those as noise.
+    df.loc[df["profit_growth_pct"].abs() > 1000, "profit_growth_pct"] = pd.NA
+    df["pe"] = df["close_price"] / df["eps_rs"]
+    df.loc[(df["eps_rs"] <= 0) | df["eps_rs"].isna(), "pe"] = pd.NA
+    df["operating_profit_cr"] = df["sales_cr"] * df["opm_pct"] / 100
+
+    # No historical shares-outstanding table, so market cap is backed out via
+    # PE algebra (shares = net profit / EPS, mcap = price x shares) instead of
+    # scraping a separate series -- equivalent to mcap = PE x net profit, and
+    # inherits PE's loss-making-year guard for free.
+    df["shares_cr"] = df["net_profit_cr"] / df["eps_rs"]
+    df.loc[(df["eps_rs"] <= 0) | df["eps_rs"].isna(), "shares_cr"] = pd.NA
+    df["market_cap_cr"] = df["close_price"] * df["shares_cr"]
+    df.loc[df["market_cap_cr"] <= 0, "market_cap_cr"] = pd.NA
+
+    df["ps_ratio"] = df["market_cap_cr"] / df["sales_cr"]
+    df.loc[df["sales_cr"] <= 0, "ps_ratio"] = pd.NA
+
+    # EV = market cap + debt; no clean cash line in the scrape, so cash isn't
+    # netted out -- EV is therefore a slight overstatement for cash-rich firms.
+    df["ev_cr"] = df["market_cap_cr"] + df["borrowings_cr"].fillna(0)
+    df["ev_to_ebitda"] = df["ev_cr"] / df["operating_profit_cr"]
+    df.loc[df["market_cap_cr"].isna() | (df["operating_profit_cr"] <= 0), "ev_to_ebitda"] = pd.NA
+
+    df["op_profit_to_cfo"] = df["operating_profit_cr"] / df["cfo_cr"]
+    df.loc[df["cfo_cr"].isna() | (df["cfo_cr"] == 0), "op_profit_to_cfo"] = pd.NA
+
+    df["op_profit_to_assets_pct"] = df["operating_profit_cr"] / df["total_assets_cr"] * 100
+    df.loc[df["total_assets_cr"].isna() | (df["total_assets_cr"] == 0), "op_profit_to_assets_pct"] = pd.NA
+    return df
+
+
+def aggregate_sector_fundamentals(raw: pd.DataFrame) -> pd.DataFrame:
+    """One row per (group, fiscal year): sector-wide size (summed revenue/profit,
+    a 'the whole sector re-rated' view) alongside the typical company's profile
+    (medians, a 'the average constituent did better' view, robust to a couple of
+    giants or new listings distorting the sum)."""
+    g = raw.groupby(["group_name", "fiscal_year"])
+    out = g.agg(
+        companies=("symbol", "nunique"),
+        total_revenue_cr=("sales_cr", "sum"),
+        total_profit_cr=("net_profit_cr", "sum"),
+        median_revenue_growth_pct=("sales_growth_pct", "median"),
+        median_profit_growth_pct=("profit_growth_pct", "median"),
+        median_roce_pct=("roce_pct", "median"),
+        median_roe_pct=("roe_pct", "median"),
+        median_pe=("pe", "median"),
+        median_opm_pct=("opm_pct", "median"),
+        median_ps_ratio=("ps_ratio", "median"),
+        median_ev_to_ebitda=("ev_to_ebitda", "median"),
+        median_op_profit_to_cfo=("op_profit_to_cfo", "median"),
+        median_op_profit_to_assets_pct=("op_profit_to_assets_pct", "median"),
+    ).reset_index()
+    return out.sort_values(["group_name", "fiscal_year"])
+
+
+def yoy_layer(level_pivot: pd.DataFrame, kind: str) -> pd.DataFrame:
+    """Row-wise year-over-year change of a metric x year pivot. Rate-like
+    metrics (kind == 'pct': ROCE/ROE/OPM/PE-as-%-ish/growth-rates themselves)
+    show the change in **percentage points** (18% -> 22% reads as +4pp), since
+    '% growth of a %' is a confusing way to read a margin or ratio move.
+    Size/multiple metrics (kind in {'num', 'ratio'}) show standard YoY % change.
+    Same near-zero-base guard as profit growth elsewhere in this section, so one
+    noisy prior-year value near zero can't blow out the whole color scale."""
+    years = sorted(level_pivot.columns)
+    lvl = level_pivot.reindex(columns=years)
+    if kind == "pct":
+        return lvl.diff(axis=1)
+    growth = lvl.pct_change(axis=1) * 100
+    return growth.where(growth.abs() <= 1000)
+
+
+def relative_layer(growth_pivot: pd.DataFrame, peer_growth_pivot: pd.DataFrame) -> pd.DataFrame:
+    """Each row's YoY change minus the peer group's median YoY change that same
+    year -- positive means beating peers that year, not just moving with them.
+    `peer_growth_pivot` sets the peer group (may differ from `growth_pivot`'s
+    own rows, e.g. peer = the sector's full membership even when the displayed
+    rows are filtered down)."""
+    peer_median = peer_growth_pivot.median(axis=0, skipna=True)
+    return growth_pivot.sub(peer_median, axis=1)
+
+
 def render_stage_help(params: dict):
     """Plain-language explainer for the Stage 1-4 framework and what the
     current slider settings mean."""
@@ -653,7 +1076,8 @@ st.title("NSE Market Data")
 
 symbols = get_symbols()
 
-SECTIONS = ["Charts", "Stage screener", "Strategy backtest", "Signal backtest", "Sector leaders", "Query / Tables"]
+SECTIONS = ["Charts", "Stage screener", "Strategy backtest", "Signal backtest", "Sector leaders",
+            "Sector fundamentals", "Fundamentals", "Query / Tables"]
 
 # Section nav lives at the top of the main area (not the sidebar) so it's one
 # tap on mobile without opening the settings drawer, and it works identically on
@@ -1510,6 +1934,475 @@ if section == "Sector leaders":
             },
         )
         st.caption("Every member of the group, unfiltered — so laggards are visible too.")
+
+if section == "Sector fundamentals":
+    st.caption(
+        "Sector-year aggregates built from every company's annual results: sector-wide size "
+        "(summed revenue/profit) alongside the typical constituent's profile (medians). Use "
+        "this to spot years a sector's *fundamentals* accelerated, not just its share price."
+    )
+
+    # (aggregate column, kind, diverging colorscale). kind drives number
+    # formatting: "pct" -> "%.1f%%", "num" -> whole-number ₹cr/PE, "ratio" ->
+    # "%.2fx" for the multiples (EV/EBITDA, Price/Sales, op. profit/CFO).
+    SF_METRICS = {
+        "Median revenue growth %": ("median_revenue_growth_pct", "pct", True),
+        "Median profit growth %": ("median_profit_growth_pct", "pct", True),
+        "Total revenue (₹ cr)": ("total_revenue_cr", "num", False),
+        "Total profit (₹ cr)": ("total_profit_cr", "num", False),
+        "Median ROCE %": ("median_roce_pct", "pct", False),
+        "Median ROE %": ("median_roe_pct", "pct", False),
+        "Median PE": ("median_pe", "num", False),
+        "Median operating margin %": ("median_opm_pct", "pct", False),
+        "Median Price/Sales": ("median_ps_ratio", "ratio", False),
+        "Median EV/EBITDA": ("median_ev_to_ebitda", "ratio", False),
+        "Median op. profit / CFO": ("median_op_profit_to_cfo", "ratio", False),
+        "Median op. profit / assets %": ("median_op_profit_to_assets_pct", "pct", False),
+    }
+
+    c1, c2 = st.columns([1, 2], vertical_alignment="bottom")
+    with c1:
+        sf_level = st.selectbox(
+            "Group by", ["macro_sector", "sector", "industry", "basic_industry"],
+            index=1, format_func=lambda s: s.replace("_", " ").title(), key="sf_level",
+        )
+    with c2:
+        sf_metric_label = st.selectbox("Metric", list(SF_METRICS), key="sf_metric")
+    sf_view_mode = st.segmented_control(
+        "View", ["Level", "YoY growth", "vs. peer median"], default="Level", key="sf_view_mode",
+        help="**Level** — the raw metric. **YoY growth** — year-over-year change (percentage points "
+        "for rate metrics like ROCE/PE/margins, % change for size metrics like revenue/profit). "
+        "**vs. peer median** — that same YoY change minus the peer group's median YoY change the same "
+        "year, so a cell lights up only when it's beating its peers, not just moving with them. Peer "
+        "group = the sectors shown below on the sector heatmap, or the sector's full membership on the "
+        "company heatmap (even if you've filtered which companies are displayed).",
+    )
+    sf_view_mode = sf_view_mode or "Level"  # segmented_control returns None if clicked off
+    sf_col, sf_kind, sf_diverging = SF_METRICS[sf_metric_label]
+    # aggregate column name -> the per-company raw column it's built from, for the
+    # constituent drill-down chart (sf_raw has no total_revenue_cr/total_profit_cr,
+    # those only exist post-aggregation; per-company they're just sales/profit).
+    SF_RAW_COL = {
+        "median_revenue_growth_pct": "sales_growth_pct", "median_profit_growth_pct": "profit_growth_pct",
+        "total_revenue_cr": "sales_cr", "total_profit_cr": "net_profit_cr",
+        "median_roce_pct": "roce_pct", "median_roe_pct": "roe_pct", "median_pe": "pe",
+        "median_opm_pct": "opm_pct", "median_ps_ratio": "ps_ratio",
+        "median_ev_to_ebitda": "ev_to_ebitda", "median_op_profit_to_cfo": "op_profit_to_cfo",
+        "median_op_profit_to_assets_pct": "op_profit_to_assets_pct",
+    }
+    sf_raw_col = SF_RAW_COL[sf_col]
+
+    sf_raw = get_sector_fundamentals_raw(sf_level)
+    if sf_raw.empty:
+        st.info("No annual fundamentals joined to sector classification yet.")
+    else:
+        sf_agg = aggregate_sector_fundamentals(sf_raw)
+
+        f1, f2 = st.columns([2, 1], vertical_alignment="bottom")
+        with f2:
+            sf_min_companies = st.number_input(
+                "Min. companies in group-year", 1, 50, 3, 1, key="sf_min_companies",
+                help="Group-years with very few reporting companies make medians noisy.",
+            )
+        sf_agg = sf_agg[sf_agg["companies"] >= sf_min_companies]
+        latest_year = sf_agg["fiscal_year"].max() if not sf_agg.empty else None
+        default_groups = (
+            sf_agg[sf_agg["fiscal_year"] == latest_year]
+            .sort_values("total_revenue_cr", ascending=False)["group_name"].head(8).tolist()
+            if latest_year is not None else []
+        )
+        with f1:
+            sf_groups = st.multiselect(
+                sf_level.replace("_", " ").title(), sorted(sf_agg["group_name"].dropna().unique()),
+                default=default_groups, key="sf_groups",
+            )
+
+        if not sf_groups:
+            st.info("Pick at least one group to chart.")
+        else:
+            plot_df = sf_agg[sf_agg["group_name"].isin(sf_groups)]
+            pivot = plot_df.pivot(index="group_name", columns="fiscal_year", values=sf_col)
+            pivot = pivot.reindex(sf_groups)  # keep the picked order, not alphabetical
+
+            st.subheader(":material/grid_on: Heatmap")
+            fmt = ".1f" if sf_kind == "pct" else (".2f" if sf_kind == "ratio" else ",.0f")
+            if sf_view_mode == "Level":
+                display_pivot, heat_diverging, cbar_title = pivot, sf_diverging, sf_metric_label
+            elif sf_view_mode == "YoY growth":
+                display_pivot = yoy_layer(pivot, sf_kind)
+                heat_diverging, cbar_title = True, f"{sf_metric_label} — YoY Δ"
+            else:
+                growth = yoy_layer(pivot, sf_kind)
+                display_pivot = relative_layer(growth, growth)  # peer = the displayed sectors themselves
+                heat_diverging, cbar_title = True, f"{sf_metric_label} — vs. peer median YoY Δ"
+            zmax = display_pivot.abs().max().max() if heat_diverging and display_pivot.notna().any().any() else None
+            fig = go.Figure(data=go.Heatmap(
+                z=display_pivot.values, x=[str(y) for y in display_pivot.columns], y=display_pivot.index,
+                colorscale="RdYlGn" if heat_diverging else "Blues",
+                zmid=0 if heat_diverging else None,
+                zmin=-zmax if zmax else None, zmax=zmax if zmax else None,
+                texttemplate="%{z:" + fmt + "}", hovertemplate="%{y} · %{x}: %{z:" + fmt + "}<extra></extra>",
+                colorbar_title=cbar_title,
+            ))
+            fig.update_layout(height=max(220, 40 * len(display_pivot) + 80), margin=dict(l=10, r=10, t=10, b=10))
+            st.plotly_chart(fig, width="stretch")
+
+            # Click-to-drill on the chart itself turned out unreliable across
+            # browsers/environments (Plotly's selection model doesn't fire
+            # consistently for Heatmap traces) -- explicit dropdowns instead,
+            # which always work.
+            st.markdown(":material/zoom_in: **Drill into a sector-year**")
+            d1, d2 = st.columns(2)
+            with d1:
+                drill_group = st.selectbox("Sector", sf_groups, key="sf_drill_group")
+            years_available = sorted(pivot.columns[pivot.loc[drill_group].notna()].tolist(), reverse=True) \
+                if drill_group in pivot.index else []
+            with d2:
+                drill_year = st.selectbox("Year", years_available, key="sf_drill_year") if years_available else None
+
+            if drill_year is not None:
+                cell_df = sf_raw[(sf_raw["group_name"] == drill_group) & (sf_raw["fiscal_year"] == drill_year)].copy()
+                mcap_df = get_mcap_map()
+                cell_df = cell_df.merge(mcap_df, on="symbol", how="left") if not mcap_df.empty \
+                    else cell_df.assign(mcap_cr=pd.NA)
+                cell_df = cell_df.sort_values("sales_cr", ascending=False)
+
+                st.caption(":material/filter_alt: Filter constituents — leave at the minimum to include everyone.")
+                ff1, ff2, ff3, ff4 = st.columns(4)
+                with ff1:
+                    min_mcap = st.number_input(
+                        "Min. market cap (₹cr)", value=0, step=500, key="sf_min_mcap",
+                        help="Current market cap (not historical). Companies with no market-cap "
+                        "snapshot are excluded once this is raised above 0.",
+                    )
+                with ff2:
+                    min_rev = st.number_input("Min. revenue (₹cr)", value=0, step=100, key="sf_min_rev")
+                with ff3:
+                    min_profit = st.number_input(
+                        "Min. profit (₹cr)", value=-100_000, step=50, key="sf_min_profit",
+                        help="Net profit for the selected year. Defaults very low so loss-making "
+                        "companies aren't excluded until you raise it.",
+                    )
+                with ff4:
+                    min_opm = st.number_input(
+                        "Min. operating profit (₹cr)", value=-100_000, step=50, key="sf_min_opm",
+                        help="Sales × OPM% for the selected year.",
+                    )
+                mask = (
+                    cell_df["sales_cr"].fillna(-1e15).ge(min_rev)
+                    & cell_df["net_profit_cr"].fillna(-1e15).ge(min_profit)
+                    & cell_df["operating_profit_cr"].fillna(-1e15).ge(min_opm)
+                )
+                if min_mcap > 0:
+                    mask &= cell_df["mcap_cr"].fillna(-1).ge(min_mcap)
+                filtered_df = cell_df[mask]
+
+                st.caption(f"{len(filtered_df)} of {len(cell_df)} companies match, for "
+                           f"{drill_group} in {drill_year}, sorted by revenue.")
+                st.dataframe(
+                    filtered_df[["symbol", "mcap_cr", "sales_cr", "sales_growth_pct", "net_profit_cr",
+                                  "profit_growth_pct", "operating_profit_cr", "roce_pct", "roe_pct", "pe"]],
+                    width="stretch", hide_index=True,
+                    column_config={
+                        "symbol": st.column_config.TextColumn("company"),
+                        "mcap_cr": st.column_config.NumberColumn("mkt cap (₹cr)", format="%,.0f"),
+                        "sales_cr": st.column_config.NumberColumn("revenue (₹cr)", format="%,.0f"),
+                        "sales_growth_pct": st.column_config.NumberColumn("revenue growth %", format="%+.1f"),
+                        "net_profit_cr": st.column_config.NumberColumn("profit (₹cr)", format="%,.0f"),
+                        "profit_growth_pct": st.column_config.NumberColumn("profit growth %", format="%+.1f"),
+                        "operating_profit_cr": st.column_config.NumberColumn("op. profit (₹cr)", format="%,.0f"),
+                        "roce_pct": st.column_config.NumberColumn("ROCE %", format="%.1f"),
+                        "roe_pct": st.column_config.NumberColumn("ROE %", format="%.1f"),
+                        "pe": st.column_config.NumberColumn("PE", format="%.1f"),
+                    },
+                )
+
+                st.caption(f"Same data as a heatmap — every filtered constituent's **{sf_metric_label}** "
+                           f"by year, ranked by revenue in {drill_year}.")
+                filtered_syms = filtered_df["symbol"].tolist()
+                if not filtered_syms:
+                    st.caption("No companies match the current filters — loosen them above.")
+                else:
+                    # Peer group for "vs. peer median" is the sector's FULL membership,
+                    # not the filtered/top-N subset -- filtering which companies are
+                    # displayed shouldn't quietly change what "the sector" means.
+                    full_sector_pivot = sf_raw[sf_raw["group_name"] == drill_group].pivot_table(
+                        index="symbol", columns="fiscal_year", values=sf_raw_col, aggfunc="first"
+                    )
+                    comp_pivot = full_sector_pivot.reindex(filtered_syms)
+                    max_n = len(comp_pivot)
+                    top_n = st.slider(
+                        "Companies to show", 1, max_n, min(20, max_n), key="sf_drill_top_n",
+                    ) if max_n > 20 else max_n
+                    comp_pivot_shown = comp_pivot.head(top_n)
+
+                    if sf_view_mode == "Level":
+                        comp_display, comp_diverging, comp_cbar_title = comp_pivot_shown, sf_diverging, sf_metric_label
+                    elif sf_view_mode == "YoY growth":
+                        comp_display = yoy_layer(comp_pivot_shown, sf_kind)
+                        comp_diverging, comp_cbar_title = True, f"{sf_metric_label} — YoY Δ"
+                    else:
+                        shown_growth = yoy_layer(comp_pivot_shown, sf_kind)
+                        full_growth = yoy_layer(full_sector_pivot, sf_kind)
+                        comp_display = relative_layer(shown_growth, full_growth)
+                        comp_diverging, comp_cbar_title = True, f"{sf_metric_label} — vs. sector median YoY Δ"
+
+                    comp_zmax = comp_display.abs().max().max() if comp_diverging and comp_display.notna().any().any() else None
+                    fig4 = go.Figure(data=go.Heatmap(
+                        z=comp_display.values, x=[str(y) for y in comp_display.columns], y=comp_display.index,
+                        colorscale="RdYlGn" if comp_diverging else "Blues",
+                        zmid=0 if comp_diverging else None,
+                        zmin=-comp_zmax if comp_zmax else None, zmax=comp_zmax if comp_zmax else None,
+                        texttemplate="%{z:" + fmt + "}", hovertemplate="%{y} · %{x}: %{z:" + fmt + "}<extra></extra>",
+                        colorbar_title=comp_cbar_title,
+                    ))
+                    fig4.update_layout(height=max(220, 26 * len(comp_display) + 80), margin=dict(l=10, r=10, t=10, b=10))
+                    st.plotly_chart(fig4, width="stretch")
+            else:
+                st.caption("No years with data for this sector.")
+
+            st.subheader(":material/bolt: Sharpest year-over-year moves")
+            st.caption(
+                f"Biggest single-year jump in **{sf_metric_label}** vs the prior year, across all "
+                f"{sf_level.replace('_', ' ')}s (not just the ones charted above) — this is where a "
+                f"sector visibly took off (or fell off a cliff)."
+            )
+            moves = sf_agg.sort_values(["group_name", "fiscal_year"]).copy()
+            moves["prior_value"] = moves.groupby("group_name")[sf_col].shift(1)
+            moves["value"] = moves[sf_col]
+            moves["delta"] = moves["value"] - moves["prior_value"]
+            moves = moves.dropna(subset=["delta"]).reindex(
+                moves["delta"].abs().sort_values(ascending=False).index
+            ).head(15)
+            if moves.empty:
+                st.caption("Not enough consecutive years of data to compute year-over-year moves.")
+            else:
+                mcols = ["group_name", "fiscal_year", "companies", "prior_value", "value", "delta"]
+                num_fmt = "%.1f" if sf_kind == "pct" else ("%.2fx" if sf_kind == "ratio" else "%,.0f")
+                delta_fmt = "%+.1f" if sf_kind == "pct" else ("%+.2fx" if sf_kind == "ratio" else "%+,.0f")
+                st.dataframe(
+                    moves[mcols], width="stretch", hide_index=True,
+                    column_config={
+                        "group_name": st.column_config.TextColumn(sf_level.replace("_", " ")),
+                        "fiscal_year": st.column_config.NumberColumn("year", format="%d"),
+                        "companies": st.column_config.NumberColumn("companies", format="%d"),
+                        "prior_value": st.column_config.NumberColumn("prior year", format=num_fmt),
+                        "value": st.column_config.NumberColumn("this year", format=num_fmt),
+                        "delta": st.column_config.NumberColumn("change", format=delta_fmt),
+                    },
+                )
+
+            with st.expander(":material/table_view: Full data table"):
+                detail = sf_agg[sf_agg["group_name"].isin(sf_groups)].sort_values(["group_name", "fiscal_year"])
+                st.dataframe(detail, width="stretch", height=360, hide_index=True)
+                st.download_button(
+                    "Download as CSV", detail.to_csv(index=False),
+                    file_name="sector_fundamentals.csv", mime="text/csv",
+                )
+
+            with st.expander(":material/warning: Caveats"):
+                st.markdown(
+                    "- **Sector classification is as-of-today**, applied to the whole history — a "
+                    "company that changed sector shows its full history in its current sector.\n"
+                    "- **Median ROE %** is only populated for Financial Services — screener.in "
+                    "reports ROE for financials and ROCE for everything else, so every other "
+                    "sector's median ROE will show blank; use median ROCE % there instead.\n"
+                    "- **Totals** (revenue/profit) reflect however many companies had reported data "
+                    "for that year, which grows over time as more history gets scraped/listed — a "
+                    "rising total can partly be more companies present, not organic growth. Prefer "
+                    "the **median growth %** metrics for a like-for-like read.\n"
+                    "- **Median PE** uses the share price as of the result's public release date "
+                    "(no lookahead) divided by that year's EPS — it can be distorted by companies "
+                    "with near-zero or negative EPS, which are excluded.\n"
+                    "- Extreme profit-growth outliers from a near-zero prior-year base (>1000%) are "
+                    "dropped as noise, not capped/winsorized.\n"
+                    "- **YoY growth / vs. peer median views**: for rate metrics (ROCE, ROE, OPM, PE, "
+                    "the growth-rate metrics themselves) the change shown is in **percentage points**, "
+                    "not a percentage of a percentage; for size/multiple metrics (revenue, profit, "
+                    "Price/Sales, EV/EBITDA, op. profit/CFO) it's a standard **% change**. The first "
+                    "year of any range has no prior year to compare, so it's blank in both modes."
+                )
+
+if section == "Fundamentals":
+    st.caption(
+        "Historical fundamentals scraped from screener.in's free company page (Quarterly "
+        "results, Profit & Loss, Balance Sheet, Cash Flow, Ratios) — laid out the same way "
+        "screener shows them, so this first pass can be spot-checked directly against the "
+        "real page. Annual history typically runs 2015-2026; quarterly is the last ~3 years, "
+        "since that's all screener's free page exposes."
+    )
+
+    fc1, fc2 = st.columns([2, 1])
+    with fc1:
+        fund_symbol = st.selectbox(
+            "Company", symbols, key="fund_symbol",
+            index=symbols.index("PIDILITIND") if "PIDILITIND" in symbols else 0,
+        )
+    with fc2:
+        horizon_label = st.selectbox(
+            "Projection horizon", list(PROJECTION_HORIZONS), key="fund_horizon",
+            help="How many future years to add to the Profit & loss and Ratios sections below "
+            "(Sales, OPM %, ROCE %, ...). Double-click a future cell and type a number, or "
+            "e.g. '15%' for growth on the prior period, then press Enter.",
+        )
+    horizon_years = PROJECTION_HORIZONS[horizon_label]
+
+    with st.expander(":material/edit_note: Notes", expanded=False):
+        note_text = st.text_area(
+            "Notes", value=get_note(fund_symbol), key=f"note_input_{fund_symbol}",
+            label_visibility="collapsed", height=120,
+            placeholder=f"Your notes on {fund_symbol} — thesis, risks, anything worth remembering.",
+        )
+        if st.button(":material/save: Save note", key="save_note_btn"):
+            save_note(fund_symbol, note_text)
+            st.toast(f"Note saved for {fund_symbol}", icon=":material/check:")
+
+    scrape_info = get_fundamentals_scrape_info(fund_symbol)
+    if scrape_info is None or scrape_info[1] != "ok":
+        status = scrape_info[1] if scrape_info else "never scraped"
+        st.warning(
+            f"No fundamentals for **{fund_symbol}** ({status}). Run "
+            "`python scrape_fundamentals_history.py` to (re)scrape — it's resumable and "
+            "skips symbols already done.",
+            icon=":material/database_off:",
+        )
+    else:
+        basis, _, scraped_at = scrape_info
+        screener_url = f"https://www.screener.in/company/{fund_symbol}/" + (
+            "consolidated/" if basis == "consolidated" else ""
+        )
+        st.caption(
+            f":material/link: [Open {fund_symbol} on screener.in]({screener_url}) to compare "
+            f"side by side — **{basis}** figures, scraped {scraped_at:%Y-%m-%d %H:%M} UTC."
+        )
+
+        # Single scrolling page instead of tabs -- the jump links get you to a
+        # section quickly, but plain scrolling lets you see two sections at
+        # once (e.g. OPM % next to ROCE %), which switching tabs didn't allow.
+        st.markdown(" · ".join(f"[{label}](#{statement})" for statement, label in FUNDAMENTALS_TABS))
+
+        raw = get_fundamentals_raw(fund_symbol)
+        projections = get_projections(fund_symbol)
+
+        for statement, label in FUNDAMENTALS_TABS:
+            st.subheader(label, anchor=statement)
+            is_projectable = statement in PROJECTION_STATEMENTS
+            if is_projectable:
+                display, values, future_cols, period_end_by_col, input_raw_by_cell = (
+                    pivot_fundamentals_with_projections(raw, projections, statement, horizon_years)
+                )
+            else:
+                display, values = pivot_fundamentals_statement(raw, statement)
+                future_cols, period_end_by_col, input_raw_by_cell = [], {}, {}
+
+            if display.empty:
+                st.caption(
+                    f"No {label.lower()} data for {fund_symbol} — common for banks/NBFCs/"
+                    "insurers, which screener reports on a different template."
+                )
+                continue
+
+            display_indexed = display.rename_axis("Metric")
+
+            if is_projectable:
+                st.caption(
+                    "Columns ending in **E** are projections — double-click a future cell, "
+                    "type a plain number or e.g. **15%** for growth on the prior period "
+                    "(chains forward like a spreadsheet formula), then press **Enter**."
+                )
+                # Keyed on a per-(statement, symbol) revision counter: after any
+                # edit is saved, bumping this forces Streamlit to mount a *fresh*
+                # data_editor instance instead of reusing the one still holding
+                # the user's raw typed text -- so the cell redraws showing the
+                # newly RESOLVED value, not what they typed (Excel-style: you
+                # type the formula, Enter commits it, the cell shows the result).
+                rev_key = f"fund_rev_{statement}_{fund_symbol}"
+                revision = st.session_state.get(rev_key, 0)
+                edited = st.data_editor(
+                    display_indexed, width="stretch", height=38 * (len(display_indexed) + 1),
+                    disabled=[c for c in display_indexed.columns if c not in future_cols],
+                    key=f"editor_{statement}_{fund_symbol}_{revision}",
+                )
+                changed = False
+                for metric in display_indexed.index:
+                    for col in future_cols:
+                        old_text, new_text = display_indexed.loc[metric, col], edited.loc[metric, col]
+                        if new_text != old_text:
+                            save_projection_cell(fund_symbol, statement, metric, period_end_by_col[col], new_text)
+                            changed = True
+                if changed:
+                    st.session_state[rev_key] = revision + 1
+                    st.rerun()
+
+                saved = {(m, c): v for (m, c), v in input_raw_by_cell.items() if v}
+                if saved:
+                    with st.expander(f":material/functions: Current assumptions ({len(saved)})", expanded=False):
+                        st.caption(" · ".join(f"**{m} / {c}**: {v}" for (m, c), v in saved.items()))
+            else:
+                st.caption("Select any range of cells, a row, or a column to see sum/average/etc.")
+                state = st.dataframe(
+                    display_indexed, width="stretch", height=38 * (len(display_indexed) + 1),
+                    on_select="rerun", selection_mode=["multi-cell", "multi-row", "multi-column"],
+                    key=f"grid_{statement}_{fund_symbol}",
+                )
+
+                selection = state.selection if hasattr(state, "selection") else {}
+                sel_cells = list(selection.get("cells", []) or [])
+                sel_rows = list(selection.get("rows", []) or [])
+                sel_cols = list(selection.get("columns", []) or [])
+
+                # Resolve every selected cell -- plus every cell implied by a
+                # selected row or column -- back to its raw float via the
+                # parallel `values` frame.
+                metrics_list = list(display_indexed.index)
+                data_cols = list(display_indexed.columns)
+                resolved_cells = set(sel_cells)
+                for r_idx in sel_rows:
+                    if 0 <= r_idx < len(metrics_list):
+                        resolved_cells.update((r_idx, c) for c in data_cols)
+                for c_name in sel_cols:
+                    resolved_cells.update((r_idx, c_name) for r_idx in range(len(metrics_list)))
+
+                selected_values = [
+                    values.iloc[r_idx][c_name]
+                    for r_idx, c_name in resolved_cells
+                    if 0 <= r_idx < len(metrics_list) and c_name in values.columns
+                    and pd.notna(values.iloc[r_idx][c_name])
+                ]
+
+                if selected_values:
+                    s1, s2, s3, s4, s5 = st.columns(5)
+                    s1.metric("Sum", f"{sum(selected_values):,.1f}")
+                    s2.metric("Average", f"{sum(selected_values) / len(selected_values):,.1f}")
+                    s3.metric("Count", f"{len(selected_values)}")
+                    s4.metric("Min", f"{min(selected_values):,.1f}")
+                    s5.metric("Max", f"{max(selected_values):,.1f}")
+
+    with st.expander(":material/info: How to read this / known limitations"):
+        st.markdown(
+            "- **Consolidated preferred, standalone fallback**: if a company reports both, "
+            "consolidated (parent + subsidiaries) is used; caption above shows which applies.\n"
+            "- **Quarterly depth is shallow (~3 years)** — screener's free page simply doesn't "
+            "expose more; annual is the source for long-run history.\n"
+            "- **ROCE % is annual-only** — screener doesn't report it per quarter.\n"
+            "- **Banks/NBFCs/insurers** (Financial Services) report P&L on a different template "
+            "with no Sales/OPM% rows — their Balance Sheet/Cash Flow/Ratios may still populate.\n"
+            "- Figures are as scraped at the timestamp above; re-run the scraper to refresh.\n"
+            "- **Projections**: double-click a future (**E**) cell, type a plain number or "
+            "e.g. **15%** for growth vs. the prior period, press Enter — it saves immediately "
+            "and the cell redraws showing the resolved value. Growth chains forward like a "
+            "spreadsheet formula (a blank cell breaks the chain for later % entries in that "
+            "row; an absolute number restarts it). Applies proportionally even to "
+            "already-percentage rows like OPM % (20 → 23, not +15 percentage points). Previously "
+            "entered assumptions are listed under **Current assumptions** below each projectable "
+            "table, since the cell itself only shows the resolved result, not the formula.\n"
+            "- **Range stats**: on Quarterly results, Balance sheet, and Cash flow, select "
+            "cells, a row, or a column to see sum/average/count/min/max above it. Not available "
+            "on Profit & loss / Ratios — editable tables can't also support range selection in "
+            "Streamlit, so those two trade stats for direct cell entry.\n"
+            "- **Projections & notes are yours** — saved locally in `fundamentals_user_data.duckdb`, "
+            "separate from the scraped data, and not touched by re-scraping."
+        )
 
 if section == "Query / Tables":
     st.subheader("Tables")
