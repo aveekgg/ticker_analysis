@@ -860,7 +860,8 @@ def get_sector_fundamentals_raw(group_level: str) -> pd.DataFrame:
         SELECT fa.symbol, im.{group_level} AS group_name, fa.period_end,
                fa.sales_cr, fa.net_profit_cr, fa.eps_rs, fa.roce_pct, fa.opm_pct,
                fa.sales_growth_pct, roe.roe_pct, dp.close AS close_price,
-               borrow.borrowings_cr, assets.total_assets_cr, cfo.cfo_cr
+               borrow.borrowings_cr, assets.total_assets_cr, cfo.cfo_cr,
+               dp_end.close AS year_end_price, dp_start.close AS year_start_price
         FROM fundamentals_annual fa
         JOIN instruments im ON im.tradingsymbol = fa.symbol
         LEFT JOIN roe ON roe.symbol = fa.symbol AND roe.period_end = fa.period_end
@@ -869,6 +870,14 @@ def get_sector_fundamentals_raw(group_level: str) -> pd.DataFrame:
         LEFT JOIN cfo ON cfo.symbol = fa.symbol AND cfo.period_end = fa.period_end
         ASOF LEFT JOIN daily_prices dp
             ON dp.tradingsymbol = fa.symbol AND dp.date <= fa.available_date
+        -- Indian FY = April-March: period_end is always ~March 31 (FY close), so
+        -- the FY's first trading day is the nearest date on/after April 1 of the
+        -- PRIOR calendar year -- nearest on/before period_end itself is the close.
+        ASOF LEFT JOIN daily_prices dp_end
+            ON dp_end.tradingsymbol = fa.symbol AND dp_end.date <= fa.period_end
+        ASOF LEFT JOIN daily_prices dp_start
+            ON dp_start.tradingsymbol = fa.symbol
+            AND dp_start.date >= make_date(CAST(extract(year FROM fa.period_end) AS INT) - 1, 4, 1)
         WHERE im.{group_level} IS NOT NULL AND fa.sales_cr IS NOT NULL
     """
     df = con.execute(query).df()
@@ -929,6 +938,8 @@ def aggregate_sector_fundamentals(raw: pd.DataFrame) -> pd.DataFrame:
         median_ev_to_ebitda=("ev_to_ebitda", "median"),
         median_op_profit_to_cfo=("op_profit_to_cfo", "median"),
         median_op_profit_to_assets_pct=("op_profit_to_assets_pct", "median"),
+        median_year_start_price=("year_start_price", "median"),
+        median_year_end_price=("year_end_price", "median"),
     ).reset_index()
     return out.sort_values(["group_name", "fiscal_year"])
 
@@ -957,6 +968,85 @@ def relative_layer(growth_pivot: pd.DataFrame, peer_growth_pivot: pd.DataFrame) 
     rows are filtered down)."""
     peer_median = peer_growth_pivot.median(axis=0, skipna=True)
     return growth_pivot.sub(peer_median, axis=1)
+
+
+def resolve_view_layer(level_pivot: pd.DataFrame, full_pivot: pd.DataFrame, kind: str,
+                        base_diverging: bool, label: str, view_mode: str):
+    """Apply the shared Level / YoY growth / vs. peer median view-mode toggle to
+    one metric's company x year pivot. `full_pivot` (the sector's full, unfiltered
+    membership) sets the peer group for 'vs. peer median' regardless of which
+    rows `level_pivot` itself contains. Returns (display_pivot, diverging, title)."""
+    if view_mode == "Level":
+        return level_pivot, base_diverging, label
+    if view_mode == "YoY growth":
+        return yoy_layer(level_pivot, kind), True, f"{label} — YoY Δ"
+    shown_growth = yoy_layer(level_pivot, kind)
+    full_growth = yoy_layer(full_pivot, kind)
+    return relative_layer(shown_growth, full_growth), True, f"{label} — vs. sector median YoY Δ"
+
+
+def build_company_heatmap(display_pivot: pd.DataFrame, diverging: bool, cbar_title: str,
+                           fmt: str, row_segments: list, primary_label: str = None,
+                           secondary_pivot: pd.DataFrame = None, secondary_fmt: str = None,
+                           secondary_label: str = None) -> go.Figure:
+    """A company x year heatmap split into stacked panels by market-cap tier
+    (MCAP_SEGMENT_ORDER) so a micro-cap's growth isn't visually stacked against
+    a behemoth's on the same footing. One shared color scale/colorbar across
+    every tier keeps colors comparable across panels.
+
+    When `secondary_pivot` is given (same index/columns as `display_pivot`),
+    color still encodes the primary metric, but each cell's text and hover
+    also show the secondary metric's value in parentheses -- one grid, both
+    numbers, so a correlation between them can be eyeballed directly instead
+    of scanning two separate heatmaps."""
+    present_segments = [seg for seg in MCAP_SEGMENT_ORDER if seg in row_segments]
+    seg_counts = {seg: row_segments.count(seg) for seg in present_segments}
+    zmax = display_pivot.abs().max().max() if diverging and display_pivot.notna().any().any() else None
+    has_secondary = secondary_pivot is not None
+    # Heatmap's texttemplate doesn't resolve %{customdata} (only hovertemplate
+    # does) -- so the combined cell text is pre-rendered into a "text" matrix
+    # and shown via %{text} instead; hover keeps using customdata directly.
+    if has_secondary:
+        hover_tmpl = (f"%{{y}} · %{{x}}<br>{primary_label}: %{{z:{fmt}}}"
+                      f"<br>{secondary_label}: %{{customdata:{secondary_fmt}}}<extra></extra>")
+    else:
+        hover_tmpl = "%{y} · %{x}: %{z:" + fmt + "}<extra></extra>"
+    fig = make_subplots(
+        rows=len(present_segments), cols=1, shared_xaxes=True,
+        row_heights=[seg_counts[seg] for seg in present_segments],
+        vertical_spacing=min(0.15, 1.2 / max(1, len(display_pivot))),
+        subplot_titles=[f"{seg} — {seg_counts[seg]} co." for seg in present_segments],
+    )
+    for i, seg in enumerate(present_segments, start=1):
+        seg_rows = [s for s, sg in zip(display_pivot.index, row_segments) if sg == seg]
+        sub = display_pivot.loc[seg_rows]
+        heat_kwargs = dict(
+            z=sub.values, x=[str(y) for y in sub.columns], y=sub.index,
+            colorscale="RdYlGn" if diverging else "Blues",
+            zmid=0 if diverging else None,
+            zmin=-zmax if zmax else None, zmax=zmax if zmax else None,
+            hovertemplate=hover_tmpl,
+            showscale=(i == 1), colorbar=dict(title=cbar_title) if i == 1 else None,
+        )
+        if has_secondary:
+            sub2 = secondary_pivot.loc[seg_rows, sub.columns]
+            heat_kwargs["customdata"] = sub2.values
+            heat_kwargs["text"] = [
+                [
+                    "" if pd.isna(zv) else (format(zv, fmt) if pd.isna(cv) else f"{format(zv, fmt)}<br>({format(cv, secondary_fmt)})")
+                    for zv, cv in zip(z_row, c_row)
+                ]
+                for z_row, c_row in zip(sub.values, sub2.values)
+            ]
+            heat_kwargs["texttemplate"] = "%{text}"
+        else:
+            heat_kwargs["texttemplate"] = "%{z:" + fmt + "}"
+        fig.add_trace(go.Heatmap(**heat_kwargs), row=i, col=1)
+    fig.update_layout(
+        height=max(280, 30 * len(display_pivot) + 50 * len(present_segments) + 40),
+        margin=dict(l=10, r=10, t=30, b=10),
+    )
+    return fig
 
 
 def render_stage_help(params: dict):
@@ -1982,6 +2072,20 @@ if section == "Sector fundamentals":
         "Median EV/EBITDA": ("median_ev_to_ebitda", "ratio", False),
         "Median op. profit / CFO": ("median_op_profit_to_cfo", "ratio", False),
         "Median op. profit / assets %": ("median_op_profit_to_assets_pct", "pct", False),
+        "Year start price (₹)": ("median_year_start_price", "num", False),
+        "Year end price (₹)": ("median_year_end_price", "num", False),
+    }
+    # aggregate column name -> the per-company raw column it's built from, for the
+    # constituent drill-down chart (sf_raw has no total_revenue_cr/total_profit_cr,
+    # those only exist post-aggregation; per-company they're just sales/profit).
+    SF_RAW_COL = {
+        "median_revenue_growth_pct": "sales_growth_pct", "median_profit_growth_pct": "profit_growth_pct",
+        "total_revenue_cr": "sales_cr", "total_profit_cr": "net_profit_cr",
+        "median_roce_pct": "roce_pct", "median_roe_pct": "roe_pct", "median_pe": "pe",
+        "median_opm_pct": "opm_pct", "median_ps_ratio": "ps_ratio",
+        "median_ev_to_ebitda": "ev_to_ebitda", "median_op_profit_to_cfo": "op_profit_to_cfo",
+        "median_op_profit_to_assets_pct": "op_profit_to_assets_pct",
+        "median_year_start_price": "year_start_price", "median_year_end_price": "year_end_price",
     }
 
     c1, c2 = st.columns([1, 2], vertical_alignment="bottom")
@@ -1991,7 +2095,10 @@ if section == "Sector fundamentals":
             index=1, format_func=lambda s: s.replace("_", " ").title(), key="sf_level",
         )
     with c2:
-        sf_metric_label = st.selectbox("Metric", list(SF_METRICS), key="sf_metric")
+        sf_metric_label = st.selectbox(
+            "Primary metric", list(SF_METRICS), key="sf_metric",
+            help="Drives the sector heatmap above and the primary company heatmap below.",
+        )
     sf_view_mode = st.segmented_control(
         "View", ["Level", "YoY growth", "vs. peer median"], default="Level", key="sf_view_mode",
         help="**Level** — the raw metric. **YoY growth** — year-over-year change (percentage points "
@@ -2003,17 +2110,6 @@ if section == "Sector fundamentals":
     )
     sf_view_mode = sf_view_mode or "Level"  # segmented_control returns None if clicked off
     sf_col, sf_kind, sf_diverging = SF_METRICS[sf_metric_label]
-    # aggregate column name -> the per-company raw column it's built from, for the
-    # constituent drill-down chart (sf_raw has no total_revenue_cr/total_profit_cr,
-    # those only exist post-aggregation; per-company they're just sales/profit).
-    SF_RAW_COL = {
-        "median_revenue_growth_pct": "sales_growth_pct", "median_profit_growth_pct": "profit_growth_pct",
-        "total_revenue_cr": "sales_cr", "total_profit_cr": "net_profit_cr",
-        "median_roce_pct": "roce_pct", "median_roe_pct": "roe_pct", "median_pe": "pe",
-        "median_opm_pct": "opm_pct", "median_ps_ratio": "ps_ratio",
-        "median_ev_to_ebitda": "ev_to_ebitda", "median_op_profit_to_cfo": "op_profit_to_cfo",
-        "median_op_profit_to_assets_pct": "op_profit_to_assets_pct",
-    }
     sf_raw_col = SF_RAW_COL[sf_col]
 
     sf_raw = get_sector_fundamentals_raw(sf_level)
@@ -2144,6 +2240,12 @@ if section == "Sector fundamentals":
                 st.caption(f"Same data as a heatmap — every filtered constituent's **{sf_metric_label}** "
                            f"by year, grouped by current market-cap tier (so a small-cap's growth isn't "
                            f"visually stacked against a behemoth's), ranked by revenue within each tier.")
+                sf_secondary_label = st.selectbox(
+                    "Secondary metric (optional)", ["(None)"] + list(SF_METRICS), key="sf_secondary_metric",
+                    help="Overlay a second heatmap for the same companies/years, plus a per-company "
+                    "correlation vs. the primary metric — e.g. does revenue growth track with price "
+                    "moves, or ROCE with EV/EBITDA re-rating.",
+                )
                 filtered_syms = filtered_df["symbol"].tolist()
                 if not filtered_syms:
                     st.caption("No companies match the current filters — loosen them above.")
@@ -2167,45 +2269,74 @@ if section == "Sector fundamentals":
                         "Companies to show", 1, max_n, min(20, max_n), key="sf_drill_top_n",
                     ) if max_n > 20 else max_n
                     comp_pivot_shown = comp_pivot.head(top_n)
+                    row_segments = [sym_to_seg.get(s, "Unknown") for s in comp_pivot_shown.index]
 
-                    if sf_view_mode == "Level":
-                        comp_display, comp_diverging, comp_cbar_title = comp_pivot_shown, sf_diverging, sf_metric_label
-                    elif sf_view_mode == "YoY growth":
-                        comp_display = yoy_layer(comp_pivot_shown, sf_kind)
-                        comp_diverging, comp_cbar_title = True, f"{sf_metric_label} — YoY Δ"
+                    comp_display, comp_diverging, comp_cbar_title = resolve_view_layer(
+                        comp_pivot_shown, full_sector_pivot, sf_kind, sf_diverging, sf_metric_label, sf_view_mode,
+                    )
+
+                    comp_display2 = None
+                    if sf_secondary_label != "(None)":
+                        sf_col2, sf_kind2, sf_diverging2 = SF_METRICS[sf_secondary_label]
+                        sf_raw_col2 = SF_RAW_COL[sf_col2]
+                        fmt2 = ".1f" if sf_kind2 == "pct" else (".2f" if sf_kind2 == "ratio" else ",.0f")
+                        full_sector_pivot2 = sf_raw[sf_raw["group_name"] == drill_group].pivot_table(
+                            index="symbol", columns="fiscal_year", values=sf_raw_col2, aggfunc="first"
+                        )
+                        comp_pivot2_shown = full_sector_pivot2.reindex(comp_pivot_shown.index)
+                        comp_display2, comp_diverging2, comp_cbar_title2 = resolve_view_layer(
+                            comp_pivot2_shown, full_sector_pivot2, sf_kind2, sf_diverging2,
+                            sf_secondary_label, sf_view_mode,
+                        )
+                        st.caption(
+                            f":material/palette: Color = **{sf_metric_label}**; the number in "
+                            f"parentheses in each cell (and in the hover) = **{sf_secondary_label}** "
+                            f"— scan for cells where both run high/low together, or diverge, to eyeball "
+                            f"correlation directly in the grid."
+                        )
+                        st.plotly_chart(
+                            build_company_heatmap(
+                                comp_display, comp_diverging, comp_cbar_title, fmt, row_segments,
+                                primary_label=sf_metric_label,
+                                secondary_pivot=comp_display2.reindex(columns=comp_display.columns),
+                                secondary_fmt=fmt2, secondary_label=sf_secondary_label,
+                            ),
+                            width="stretch",
+                        )
                     else:
-                        shown_growth = yoy_layer(comp_pivot_shown, sf_kind)
-                        full_growth = yoy_layer(full_sector_pivot, sf_kind)
-                        comp_display = relative_layer(shown_growth, full_growth)
-                        comp_diverging, comp_cbar_title = True, f"{sf_metric_label} — vs. sector median YoY Δ"
+                        st.plotly_chart(
+                            build_company_heatmap(comp_display, comp_diverging, comp_cbar_title, fmt, row_segments),
+                            width="stretch",
+                        )
 
-                    comp_zmax = comp_display.abs().max().max() if comp_diverging and comp_display.notna().any().any() else None
-                    row_segments = [sym_to_seg.get(s, "Unknown") for s in comp_display.index]
-                    present_segments = [seg for seg in MCAP_SEGMENT_ORDER if seg in row_segments]
-                    seg_counts = {seg: row_segments.count(seg) for seg in present_segments}
-
-                    fig4 = make_subplots(
-                        rows=len(present_segments), cols=1, shared_xaxes=True,
-                        row_heights=[seg_counts[seg] for seg in present_segments],
-                        vertical_spacing=min(0.15, 1.2 / max(1, len(comp_display))),
-                        subplot_titles=[f"{seg} — {seg_counts[seg]} co." for seg in present_segments],
-                    )
-                    for i, seg in enumerate(present_segments, start=1):
-                        seg_rows = [s for s, sg in zip(comp_display.index, row_segments) if sg == seg]
-                        sub = comp_display.loc[seg_rows]
-                        fig4.add_trace(go.Heatmap(
-                            z=sub.values, x=[str(y) for y in sub.columns], y=sub.index,
-                            colorscale="RdYlGn" if comp_diverging else "Blues",
-                            zmid=0 if comp_diverging else None,
-                            zmin=-comp_zmax if comp_zmax else None, zmax=comp_zmax if comp_zmax else None,
-                            texttemplate="%{z:" + fmt + "}", hovertemplate="%{y} · %{x}: %{z:" + fmt + "}<extra></extra>",
-                            showscale=(i == 1), colorbar=dict(title=comp_cbar_title) if i == 1 else None,
-                        ), row=i, col=1)
-                    fig4.update_layout(
-                        height=max(280, 26 * len(comp_display) + 50 * len(present_segments) + 40),
-                        margin=dict(l=10, r=10, t=30, b=10),
-                    )
-                    st.plotly_chart(fig4, width="stretch")
+                    if comp_display2 is not None:
+                        st.markdown(
+                            f":material/scatter_plot: **Correlation — {sf_metric_label} vs. {sf_secondary_label}** "
+                            f"(Pearson r, per company across its own years shown above, using the "
+                            f"**{sf_view_mode}** view; needs at least 3 overlapping years)."
+                        )
+                        corr_rows = []
+                        for sym in comp_display.index:
+                            paired = pd.DataFrame({"a": comp_display.loc[sym], "b": comp_display2.loc[sym]}).dropna()
+                            if len(paired) >= 3:
+                                corr_rows.append({
+                                    "symbol": sym, "segment": sym_to_seg.get(sym, "Unknown"),
+                                    "years": len(paired), "correlation": paired["a"].corr(paired["b"]),
+                                })
+                        if not corr_rows:
+                            st.caption("No shown company has ≥3 overlapping years for both metrics.")
+                        else:
+                            corr_df = pd.DataFrame(corr_rows)
+                            corr_df = corr_df.reindex(corr_df["correlation"].abs().sort_values(ascending=False).index)
+                            st.dataframe(
+                                corr_df, width="stretch", hide_index=True,
+                                column_config={
+                                    "symbol": st.column_config.TextColumn("company"),
+                                    "segment": st.column_config.TextColumn("mkt-cap tier"),
+                                    "years": st.column_config.NumberColumn("years used", format="%d"),
+                                    "correlation": st.column_config.NumberColumn("correlation (r)", format="%.2f"),
+                                },
+                            )
             else:
                 st.caption("No years with data for this sector.")
 
@@ -2268,7 +2399,16 @@ if section == "Sector fundamentals":
                     "the growth-rate metrics themselves) the change shown is in **percentage points**, "
                     "not a percentage of a percentage; for size/multiple metrics (revenue, profit, "
                     "Price/Sales, EV/EBITDA, op. profit/CFO) it's a standard **% change**. The first "
-                    "year of any range has no prior year to compare, so it's blank in both modes."
+                    "year of any range has no prior year to compare, so it's blank in both modes.\n"
+                    "- **Every year here is an Indian financial year (April-March)** — 'fiscal year "
+                    "2024' means the 12 months to 31 March 2024. **Year start price** is the nearest "
+                    "trading day on/after 1 April of the prior calendar year; **Year end price** is the "
+                    "nearest trading day on/before that 31 March — so 'YoY growth' on either one reads "
+                    "as a full-FY price return.\n"
+                    "- **Secondary metric / correlation**: the correlation table is a per-company "
+                    "Pearson r computed on whichever layer is on screen (Level, YoY growth, or vs. peer "
+                    "median) across that company's own years — a small sample (as few as 3 points), so "
+                    "treat it as a directional hint, not a statistically robust result."
                 )
 
 if section == "Fundamentals":
@@ -2331,7 +2471,14 @@ if section == "Fundamentals":
         if raw.empty:
             st.caption("No data to chart.")
         else:
-            cv1, cv2, cv3 = st.columns([1, 3, 1.3], vertical_alignment="bottom")
+            cv0, cv1, cv2, cv3 = st.columns([1.4, 1, 3, 1.3], vertical_alignment="bottom")
+            with cv0:
+                chart_mode = st.radio(
+                    "Chart type", ["Overlay (line)", "Small multiples (bar)"], key="fund_chart_mode",
+                    help="**Overlay** plots every selected metric as lines on one shared chart. "
+                    "**Small multiples** gives each metric its own bar chart, tiled two per row — "
+                    "easier to read many metrics at once since each keeps its own scale.",
+                )
             with cv1:
                 chart_period_label = st.segmented_control(
                     "Period", ["Annual", "Quarterly"], default="Annual", key="fund_chart_period",
@@ -2346,12 +2493,15 @@ if section == "Fundamentals":
                     "Metrics", available_metrics, default=default_metrics, key=f"fund_chart_metrics_{chart_period}",
                 )
             with cv3:
-                normalize = st.checkbox(
-                    "Normalize to 100", key="fund_chart_normalize",
-                    help="Index every selected metric to 100 at its first shown period, so metrics "
-                    "with different units (₹cr vs % vs days) can be compared on one axis by growth "
-                    "trajectory instead of absolute scale.",
-                )
+                if chart_mode == "Overlay (line)":
+                    normalize = st.checkbox(
+                        "Normalize to 100", key="fund_chart_normalize",
+                        help="Index every selected metric to 100 at its first shown period, so metrics "
+                        "with different units (₹cr vs % vs days) can be compared on one axis by growth "
+                        "trajectory instead of absolute scale.",
+                    )
+                else:
+                    normalize = False
 
             if not chart_metrics:
                 st.info("Pick at least one metric to chart.")
@@ -2360,49 +2510,76 @@ if section == "Fundamentals":
             else:
                 chart_raw = raw[(raw["period_type"] == chart_period) & (raw["metric"].isin(chart_metrics))].copy()
                 chart_raw["period_end"] = pd.to_datetime(chart_raw["period_end"])
-                figc = go.Figure()
-                unit_axis, units_present = {}, []
-                for metric in chart_metrics:
-                    series = chart_raw[chart_raw["metric"] == metric].dropna(subset=["value"]).sort_values("period_end")
-                    if series.empty:
-                        continue
-                    unit = series["unit"].iloc[0]
-                    y = series["value"]
-                    hover_suffix = ""
+
+                if chart_mode == "Overlay (line)":
+                    figc = go.Figure()
+                    unit_axis, units_present = {}, []
+                    for metric in chart_metrics:
+                        series = chart_raw[chart_raw["metric"] == metric].dropna(subset=["value"]).sort_values("period_end")
+                        if series.empty:
+                            continue
+                        unit = series["unit"].iloc[0]
+                        y = series["value"]
+                        hover_suffix = ""
+                        if normalize:
+                            first = y.iloc[0]
+                            if first:
+                                y = y / first * 100
+                                hover_suffix = " (indexed)"
+                            axis = "y"
+                        else:
+                            if unit not in unit_axis:
+                                unit_axis[unit] = "y" if not unit_axis else "y2"
+                                units_present.append(unit)
+                            axis = unit_axis[unit]
+                        figc.add_trace(go.Scatter(
+                            x=series["period_end"], y=y, mode="lines+markers", name=metric, yaxis=axis,
+                            hovertemplate=f"{metric}" + "<br>%{x|%b %Y}: %{y:,.1f}" + hover_suffix + "<extra></extra>",
+                        ))
+                    layout_kwargs = dict(
+                        height=420, margin=dict(l=10, r=10, t=30, b=10),
+                        legend=dict(orientation="h", yanchor="bottom", y=1.02),
+                    )
                     if normalize:
-                        first = y.iloc[0]
-                        if first:
-                            y = y / first * 100
-                            hover_suffix = " (indexed)"
-                        axis = "y"
+                        layout_kwargs["yaxis"] = dict(title="Indexed to 100")
                     else:
-                        if unit not in unit_axis:
-                            unit_axis[unit] = "y" if not unit_axis else "y2"
-                            units_present.append(unit)
-                        axis = unit_axis[unit]
-                    figc.add_trace(go.Scatter(
-                        x=series["period_end"], y=y, mode="lines+markers", name=metric, yaxis=axis,
-                        hovertemplate=f"{metric}" + "<br>%{x|%b %Y}: %{y:,.1f}" + hover_suffix + "<extra></extra>",
-                    ))
-                layout_kwargs = dict(
-                    height=420, margin=dict(l=10, r=10, t=30, b=10),
-                    legend=dict(orientation="h", yanchor="bottom", y=1.02),
-                )
-                if normalize:
-                    layout_kwargs["yaxis"] = dict(title="Indexed to 100")
+                        if units_present:
+                            layout_kwargs["yaxis"] = dict(title=units_present[0])
+                        if len(units_present) > 1:
+                            layout_kwargs["yaxis2"] = dict(title=units_present[1], overlaying="y", side="right")
+                        if len(units_present) > 2:
+                            st.caption(
+                                f":material/warning: **{', '.join(units_present[2:])}** share the right "
+                                f"axis with **{units_present[1]}** — scales may not line up. Check "
+                                "**Normalize to 100** or pick metrics with matching units."
+                            )
+                    figc.update_layout(**layout_kwargs)
+                    st.plotly_chart(figc, width="stretch")
                 else:
-                    if units_present:
-                        layout_kwargs["yaxis"] = dict(title=units_present[0])
-                    if len(units_present) > 1:
-                        layout_kwargs["yaxis2"] = dict(title=units_present[1], overlaying="y", side="right")
-                    if len(units_present) > 2:
-                        st.caption(
-                            f":material/warning: **{', '.join(units_present[2:])}** share the right "
-                            f"axis with **{units_present[1]}** — scales may not line up. Check "
-                            "**Normalize to 100** or pick metrics with matching units."
-                        )
-                figc.update_layout(**layout_kwargs)
-                st.plotly_chart(figc, width="stretch")
+                    st.caption(
+                        f"One bar chart per metric ({chart_period_label.lower()} figures for "
+                        f"**{fund_symbol}**), each on its own scale — tiled two per row."
+                    )
+                    tile_cols = st.columns(2)
+                    for idx, metric in enumerate(chart_metrics):
+                        series = chart_raw[chart_raw["metric"] == metric].dropna(subset=["value"]).sort_values("period_end")
+                        with tile_cols[idx % 2]:
+                            if series.empty:
+                                st.caption(f"**{metric}** — no data.")
+                                continue
+                            unit = series["unit"].iloc[0]
+                            bar_colors = ["#e57373" if v < 0 else "#66bb6a" for v in series["value"]] \
+                                if series["value"].lt(0).any() else "#42a5f5"
+                            figm = go.Figure(go.Bar(
+                                x=series["period_end"], y=series["value"], marker_color=bar_colors,
+                                hovertemplate="%{x|%b %Y}: %{y:,.1f}<extra></extra>",
+                            ))
+                            figm.update_layout(
+                                title=dict(text=f"{metric} ({unit})", font=dict(size=13)),
+                                height=280, margin=dict(l=10, r=10, t=36, b=10),
+                                showlegend=False,
+                            )
+                            st.plotly_chart(figm, width="stretch")
 
         # Single scrolling page instead of tabs -- the jump links get you to a
         # section quickly, but plain scrolling lets you see two sections at
@@ -2527,11 +2704,14 @@ if section == "Fundamentals":
             "Streamlit, so those two trade stats for direct cell entry.\n"
             "- **Projections & notes are yours** — saved locally in `fundamentals_user_data.duckdb`, "
             "separate from the scraped data, and not touched by re-scraping.\n"
-            "- **Chart view**: pick any metrics (annual or quarterly) to plot over time. Metrics "
-            "sharing a unit share an axis; a second unit gets its own right-hand axis; a third+ "
-            "unit shares the right axis (scales won't line up — use **Normalize to 100** instead, "
-            "which indexes every series to its first shown period so growth trajectories compare "
-            "cleanly regardless of units)."
+            "- **Chart view**: pick any metrics (annual or quarterly) to plot over time, in either of "
+            "two chart types. **Overlay (line)** puts every metric on one shared chart — metrics "
+            "sharing a unit share an axis; a second unit gets its own right-hand axis; a third+ unit "
+            "shares the right axis (scales won't line up — use **Normalize to 100** instead, which "
+            "indexes every series to its first shown period so growth trajectories compare cleanly "
+            "regardless of units). **Small multiples (bar)** instead gives each metric its own bar "
+            "chart on its own scale, tiled two per row — better when comparing several metrics whose "
+            "units don't mix well on one axis."
         )
 
 if section == "Query / Tables":
