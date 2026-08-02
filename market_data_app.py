@@ -857,7 +857,7 @@ def get_sector_fundamentals_raw(group_level: str) -> pd.DataFrame:
             SELECT symbol, period_end, value AS cfo_cr
             FROM fundamentals_raw WHERE statement = 'cash_flow' AND metric = 'Cash from Operating Activity'
         )
-        SELECT fa.symbol, im.{group_level} AS group_name, fa.period_end,
+        SELECT fa.symbol, im.{group_level} AS group_name, fa.period_end, fa.available_date,
                fa.sales_cr, fa.net_profit_cr, fa.eps_rs, fa.roce_pct, fa.opm_pct,
                fa.sales_growth_pct, roe.roe_pct, dp.close AS close_price,
                borrow.borrowings_cr, assets.total_assets_cr, cfo.cfo_cr,
@@ -882,6 +882,7 @@ def get_sector_fundamentals_raw(group_level: str) -> pd.DataFrame:
     """
     df = con.execute(query).df()
     df["period_end"] = pd.to_datetime(df["period_end"])
+    df["available_date"] = pd.to_datetime(df["available_date"])
     df["fiscal_year"] = df["period_end"].dt.year
     df = df.sort_values(["symbol", "period_end"])
     df["profit_growth_pct"] = df.groupby("symbol")["net_profit_cr"].pct_change() * 100
@@ -1049,6 +1050,129 @@ def build_company_heatmap(display_pivot: pd.DataFrame, diverging: bool, cbar_tit
     return fig
 
 
+# --- Strategy Discovery: "how many times in the past did a company meeting
+# entry condition(s) X go on to see forward growth/return Y" -- annual
+# granularity (10yr+ typical depth per company, vs. ~3yr for quarterly data,
+# which isn't a real archive -- just a trailing window as of the last scrape). ---
+
+# (raw column, kind) -- kind drives number formatting, same convention as
+# SF_METRICS/SF_RAW_COL in the Sector fundamentals section.
+ENTRY_METRICS = {
+    "PE": ("pe", "ratio"),
+    "EV/EBITDA": ("ev_to_ebitda", "ratio"),
+    "Price/Sales": ("ps_ratio", "ratio"),
+    "Operating margin (OPM %)": ("opm_pct", "pct"),
+    "ROCE %": ("roce_pct", "pct"),
+    "ROE %": ("roe_pct", "pct"),
+    "Op. profit / CFO": ("op_profit_to_cfo", "ratio"),
+    "Op. profit / assets %": ("op_profit_to_assets_pct", "pct"),
+    "Revenue growth % (YoY)": ("sales_growth_pct", "pct"),
+    "Profit growth % (YoY)": ("profit_growth_pct", "pct"),
+    "Market cap (₹ cr)": ("market_cap_cr", "num"),
+    "Revenue (₹ cr)": ("sales_cr", "num"),
+    "Net profit (₹ cr)": ("net_profit_cr", "num"),
+}
+ENTRY_METRIC_FMT = {"pct": "%.1f", "ratio": "%.2fx", "num": "%,.0f"}
+
+
+@st.cache_data(show_spinner="Computing forward outcomes across the universe...")
+def compute_forward_outcomes(raw: pd.DataFrame, horizon_years: int) -> pd.DataFrame:
+    """One row per (symbol, entry fiscal year): that year's entry-condition
+    metrics plus what happened over the next `horizon_years` -- revenue CAGR,
+    profit CAGR, and stock CAGR (entry/exit prices both taken as-of the
+    result's public release date, so no lookahead, consistent with `pe`).
+
+    CAGR needs a positive base and a positive endpoint (a negative-to-positive
+    profit swing has no real geometric growth rate) -- those cells are left
+    blank rather than a misleading number. A company's own history can have
+    gaps (a missed scrape year), so the forward row is only used when it's
+    genuinely `horizon_years` of fiscal years ahead, not just N rows away."""
+    df = raw.sort_values(["symbol", "fiscal_year"]).reset_index(drop=True).copy()
+    g = df.groupby("symbol")
+    df["exit_fiscal_year"] = df["fiscal_year"] + horizon_years
+    df["future_sales_cr"] = g["sales_cr"].shift(-horizon_years)
+    df["future_net_profit_cr"] = g["net_profit_cr"].shift(-horizon_years)
+    df["future_close_price"] = g["close_price"].shift(-horizon_years)
+    future_fiscal_year = g["fiscal_year"].shift(-horizon_years)
+    valid_gap = future_fiscal_year == df["exit_fiscal_year"]
+    for col in ["future_sales_cr", "future_net_profit_cr", "future_close_price"]:
+        df.loc[~valid_gap, col] = float("nan")
+
+    def cagr(base, future):
+        ok = valid_gap & base.gt(0) & future.gt(0)
+        out = pd.Series(float("nan"), index=df.index, dtype="float64")
+        out[ok] = ((future[ok] / base[ok]) ** (1 / horizon_years) - 1) * 100
+        return out
+
+    df["revenue_cagr_pct"] = cagr(df["sales_cr"], df["future_sales_cr"])
+    df["profit_cagr_pct"] = cagr(df["net_profit_cr"], df["future_net_profit_cr"])
+    df["stock_cagr_pct"] = cagr(df["close_price"], df["future_close_price"])
+    return df
+
+
+def apply_entry_conditions(df: pd.DataFrame, conditions: list) -> pd.DataFrame:
+    """`conditions`: list of (raw_col, operator, threshold). Empty/skipped
+    slots are pre-filtered out by the caller. ANDs every condition together --
+    an OR-capable builder is a possible later extension, not needed for the
+    'PE > X and margin > Y' shape of question this is built for."""
+    mask = pd.Series(True, index=df.index)
+    for col, op, threshold in conditions:
+        series = df[col]
+        if op == ">":
+            cond = series > threshold
+        elif op == "≥":
+            cond = series >= threshold
+        elif op == "<":
+            cond = series < threshold
+        else:
+            cond = series <= threshold
+        mask &= cond.fillna(False)
+    return df[mask]
+
+
+# Percentage-point metrics where a *change* is the meaningful signal (a margin
+# or return ratio moving), as opposed to level/multiple metrics like PE or
+# EV/EBITDA where the level itself is what makes a stock "expensive."
+TRANSITION_METRICS = {lbl: col for lbl, (col, kind) in ENTRY_METRICS.items() if kind == "pct"}
+
+
+def compute_transition_signal(df: pd.DataFrame, metric_col: str, direction: str,
+                               delta_threshold: float, stability_years: int,
+                               band_tolerance: float):
+    """Flags (symbol, fiscal year) rows where `metric_col` moved by at least
+    `delta_threshold` percentage points vs. the prior year (a 'turnaround'),
+    and then -- if `stability_years` > 0 -- stayed within `band_tolerance` pp
+    of that new level for each of the following `stability_years` years (so a
+    one-year blip doesn't count as a real structural change). Entry is dated
+    at the jump year itself: this studies 'when a change like this turns out
+    to be real, what tends to follow', not a live tradeable signal -- knowing
+    it held requires the later years' data, which is future information
+    relative to the jump year (see Caveats).
+
+    Returns (mask, delta) both aligned to `df.index`."""
+    d = df.sort_values(["symbol", "fiscal_year"])
+    g = d.groupby("symbol")
+    prior = g[metric_col].shift(1)
+    delta = d[metric_col] - prior
+    jump_ok = (delta >= delta_threshold) if direction == "increase" else (delta <= -delta_threshold)
+    jump_ok = jump_ok.fillna(False)
+
+    stable_ok = pd.Series(True, index=d.index)
+    if stability_years > 0:
+        have_enough = pd.Series(True, index=d.index)
+        for k in range(1, stability_years + 1):
+            future_val = g[metric_col].shift(-k)
+            future_fy = g["fiscal_year"].shift(-k)
+            valid_k = future_fy == (d["fiscal_year"] + k)
+            within_band = ((future_val - d[metric_col]).abs() <= band_tolerance).fillna(False)
+            stable_ok &= (within_band & valid_k)
+            have_enough &= valid_k
+        stable_ok &= have_enough
+
+    mask = jump_ok & stable_ok
+    return mask.reindex(df.index).fillna(False), delta.reindex(df.index)
+
+
 def render_stage_help(params: dict):
     """Plain-language explainer for the Stage 1-4 framework and what the
     current slider settings mean."""
@@ -1191,7 +1315,7 @@ st.title("NSE Market Data")
 symbols = get_symbols()
 
 SECTIONS = ["Charts", "Stage screener", "Strategy backtest", "Signal backtest", "Sector leaders",
-            "Sector fundamentals", "Fundamentals", "Query / Tables"]
+            "Sector fundamentals", "Strategy Discovery", "Fundamentals", "Query / Tables"]
 
 # Section nav lives at the top of the main area (not the sidebar) so it's one
 # tap on mobile without opening the settings drawer, and it works identically on
@@ -2410,6 +2534,306 @@ if section == "Sector fundamentals":
                     "median) across that company's own years — a small sample (as few as 3 points), so "
                     "treat it as a directional hint, not a statistically robust result."
                 )
+
+if section == "Strategy Discovery":
+    st.caption(
+        "Screen the annual fundamentals history for every company-year matching entry "
+        "condition(s), then see what actually happened next — forward revenue/profit growth "
+        "and forward stock return. **Annual granularity only**: it has ~10 years of depth per "
+        "company on average, vs. quarterly data's ~3-year *trailing* window (not a real "
+        "archive — just however far back the last scrape reached), so annual is where a "
+        "'how many times in the past' answer is actually statistically meaningful."
+    )
+
+    disc_raw = get_sector_fundamentals_raw("sector")  # per-company-year, universe-wide
+
+    st.markdown(":material/rule: **Entry conditions** — leave a slot at *(none)* to skip it; the rest AND together.")
+    metric_labels = ["(none)"] + list(ENTRY_METRICS)
+    entry_defaults = [("PE", ">", 30.0), ("(none)", ">", 0.0), ("(none)", ">", 0.0)]
+    conditions_input = []
+    cond_cols = st.columns(3)
+    for i, ccol in enumerate(cond_cols):
+        with ccol:
+            default_label, default_op, default_val = entry_defaults[i]
+            m_label = st.selectbox(
+                f"Condition {i + 1}", metric_labels,
+                index=metric_labels.index(default_label), key=f"sd_metric_{i}",
+            )
+            if m_label != "(none)":
+                oc1, oc2 = st.columns([1, 2])
+                with oc1:
+                    op = st.selectbox(
+                        "Op.", [">", "≥", "<", "≤"],
+                        index=[">", "≥", "<", "≤"].index(default_op), key=f"sd_op_{i}",
+                    )
+                with oc2:
+                    threshold = st.number_input(
+                        "Threshold", value=default_val, key=f"sd_thresh_{i}",
+                    )
+                conditions_input.append((ENTRY_METRICS[m_label][0], op, threshold))
+
+    st.markdown(
+        ":material/trending_up: **Turnaround condition (optional)** — track a *change* in a "
+        "percentage-point metric instead of its level: e.g. OPM jumped at least 5pp vs. the "
+        "prior year, and held within ±3pp of that new level the year after (so a one-year blip "
+        "doesn't count as a real structural change). Level filters like PE/EV-EBITDA above are "
+        "left as levels on purpose — 'expensive' is about where a multiple sits, not how far it moved."
+    )
+    tc0, tc1, tc2, tc3, tc4 = st.columns([1.6, 1.5, 1.1, 1, 1], vertical_alignment="bottom")
+    with tc0:
+        use_transition = st.checkbox("Add turnaround condition", value=False, key="sd_use_transition")
+    with tc1:
+        trans_label = st.selectbox(
+            "Metric", list(TRANSITION_METRICS), key="sd_trans_metric", disabled=not use_transition,
+        )
+    with tc2:
+        trans_direction = st.selectbox(
+            "Direction", ["increase", "decrease"], key="sd_trans_direction", disabled=not use_transition,
+            format_func=lambda d: "Increased by ≥" if d == "increase" else "Decreased by ≥",
+        )
+    with tc3:
+        trans_delta = st.number_input(
+            "Min. change (pp)", value=5.0, step=0.5, min_value=0.0, key="sd_trans_delta",
+            disabled=not use_transition,
+        )
+    with tc4:
+        trans_band = st.number_input(
+            "±band (pp)", value=3.0, step=0.5, min_value=0.0, key="sd_trans_band",
+            disabled=not use_transition,
+        )
+    trans_stability_years = st.number_input(
+        "Hold within the band for this many years after the jump (0 = just require the jump, no stability check)",
+        0, 3, 1, 1, key="sd_trans_stability_years", disabled=not use_transition,
+    )
+
+    hc1, hc2, hc3 = st.columns([1, 2, 2], vertical_alignment="top")
+    with hc1:
+        horizon_years = st.number_input(
+            "Forward window (years)", 1, 8, 3, 1, key="sd_horizon",
+            help="How many fiscal years ahead to measure growth/return over.",
+        )
+    with hc2:
+        require_growth = st.checkbox("Require forward growth", value=True, key="sd_require_growth")
+        growth_metric = st.selectbox(
+            "Growth metric", ["Either (revenue or profit)", "Revenue CAGR", "Profit CAGR"],
+            key="sd_growth_metric", disabled=not require_growth, label_visibility="collapsed",
+        )
+        growth_threshold = st.number_input(
+            "Min. forward CAGR (%)", value=15.0, step=1.0, key="sd_growth_threshold",
+            disabled=not require_growth,
+        )
+    with hc3:
+        require_stock = st.checkbox("Require forward stock return", value=False, key="sd_require_stock")
+        stock_threshold = st.number_input(
+            "Min. stock CAGR (%)", value=15.0, step=1.0, key="sd_stock_threshold",
+            disabled=not require_stock, help="Leave unchecked to just see forward stock CAGR for every match.",
+        )
+
+    if not conditions_input and not use_transition:
+        st.info("Pick at least one entry condition, or add a turnaround condition, above.")
+    else:
+        outcomes_all = compute_forward_outcomes(disc_raw, horizon_years)
+        matched = apply_entry_conditions(outcomes_all, conditions_input) if conditions_input else outcomes_all
+
+        trans_delta_col = None
+        if use_transition:
+            trans_col = TRANSITION_METRICS[trans_label]
+            trans_mask, trans_delta_series = compute_transition_signal(
+                outcomes_all, trans_col, trans_direction, trans_delta, trans_stability_years, trans_band,
+            )
+            matched = matched[trans_mask.reindex(matched.index, fill_value=False)]
+            trans_delta_col = f"{trans_col}_delta_pp"
+            matched = matched.assign(**{trans_delta_col: trans_delta_series.reindex(matched.index)})
+
+        scored = matched[matched["stock_cagr_pct"].notna()]
+
+        if require_growth:
+            if growth_metric == "Revenue CAGR":
+                growth_ok = scored["revenue_cagr_pct"] >= growth_threshold
+            elif growth_metric == "Profit CAGR":
+                growth_ok = scored["profit_cagr_pct"] >= growth_threshold
+            else:
+                growth_ok = (scored["revenue_cagr_pct"] >= growth_threshold) | (scored["profit_cagr_pct"] >= growth_threshold)
+            growth_ok = growth_ok.fillna(False)
+        else:
+            growth_ok = pd.Series(True, index=scored.index)
+        stock_ok = scored["stock_cagr_pct"] >= stock_threshold if require_stock else pd.Series(True, index=scored.index)
+        hits = scored[growth_ok & stock_ok]
+
+        baseline_years = sorted(matched["fiscal_year"].dropna().unique().tolist())
+        baseline = outcomes_all[
+            outcomes_all["fiscal_year"].isin(baseline_years) & outcomes_all["stock_cagr_pct"].notna()
+        ]
+
+        st.divider()
+        st.subheader(":material/query_stats: Results")
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Entry matches", f"{len(matched)}")
+        m2.metric("With computable forward outcome", f"{len(scored)}",
+                   help="Excludes matches too recent for the forward window to have played out yet, "
+                   "or where CAGR isn't well-defined (e.g. a loss-making entry or exit year).")
+        m3.metric("Meeting forward condition(s)", f"{len(hits)}")
+        hit_rate = (len(hits) / len(scored) * 100) if len(scored) else float("nan")
+        m4.metric("Hit rate", f"{hit_rate:.0f}%" if pd.notna(hit_rate) else "—")
+
+        if len(scored) and len(baseline):
+            st.caption(
+                f":material/balance: **Baseline check** — over the same {len(baseline_years)} entry "
+                f"year(s), *every* company in the universe that year (not just your matches) had a "
+                f"median forward {horizon_years}-yr stock CAGR of "
+                f"**{baseline['stock_cagr_pct'].median():+.1f}%** (n={len(baseline)}) vs. your matched "
+                f"cohort's **{scored['stock_cagr_pct'].median():+.1f}%** (n={len(scored)}) — this is "
+                f"the real test of whether the entry condition adds anything over buying broadly in "
+                f"the same years, not just riding the same market."
+            )
+            fig_dist = go.Figure()
+            fig_dist.add_trace(go.Histogram(
+                x=baseline["stock_cagr_pct"], name=f"Baseline (n={len(baseline)})",
+                opacity=0.55, marker_color="#9e9e9e", histnorm="percent",
+            ))
+            fig_dist.add_trace(go.Histogram(
+                x=scored["stock_cagr_pct"], name=f"Matched (n={len(scored)})",
+                opacity=0.65, marker_color="#42a5f5", histnorm="percent",
+            ))
+            fig_dist.update_layout(
+                barmode="overlay", height=320, margin=dict(l=10, r=10, t=30, b=10),
+                xaxis_title=f"Forward {horizon_years}-yr stock CAGR (%)", yaxis_title="% of instances",
+                legend=dict(orientation="h", yanchor="bottom", y=1.02),
+            )
+            st.plotly_chart(fig_dist, width="stretch")
+
+        used_cols = [c for c, _, _ in conditions_input]
+        display_cols = list(dict.fromkeys(
+            ["symbol", "group_name", "fiscal_year", "exit_fiscal_year"] + used_cols
+            + ([trans_delta_col] if trans_delta_col else [])
+            + ["revenue_cagr_pct", "profit_cagr_pct", "stock_cagr_pct"]
+        ))
+        table_df = scored[display_cols].sort_values("stock_cagr_pct", ascending=False)
+        col_config = {
+            "symbol": st.column_config.TextColumn("company"),
+            "group_name": st.column_config.TextColumn("sector"),
+            "fiscal_year": st.column_config.NumberColumn("entry FY", format="%d"),
+            "exit_fiscal_year": st.column_config.NumberColumn("exit FY", format="%d"),
+            "revenue_cagr_pct": st.column_config.NumberColumn("revenue CAGR %", format="%+.1f"),
+            "profit_cagr_pct": st.column_config.NumberColumn("profit CAGR %", format="%+.1f"),
+            "stock_cagr_pct": st.column_config.NumberColumn("stock CAGR %", format="%+.1f"),
+        }
+        for lbl, (col, kind) in ENTRY_METRICS.items():
+            if col in display_cols:
+                col_config[col] = st.column_config.NumberColumn(lbl, format=ENTRY_METRIC_FMT[kind])
+        if trans_delta_col:
+            col_config[trans_delta_col] = st.column_config.NumberColumn(f"{trans_label} Δ (pp)", format="%+.1f")
+        st.caption("Every matched instance with a computable forward outcome, sorted by forward stock CAGR.")
+        st.dataframe(table_df, width="stretch", height=380, hide_index=True, column_config=col_config)
+        st.download_button(
+            "Download as CSV", table_df.to_csv(index=False),
+            file_name="strategy_discovery_matches.csv", mime="text/csv",
+        )
+        st.caption(
+            ":material/info: Each row is one (company, entry-year) instance, **not an independent "
+            "trial** — the same company can appear in several years, and its outcomes in nearby "
+            "years are correlated, not statistically independent samples."
+        )
+
+        st.divider()
+        st.subheader(":material/zoom_in: Drill into a match")
+        if table_df.empty:
+            st.caption("No matches to drill into — loosen the conditions above.")
+        else:
+            dd1, dd2 = st.columns(2)
+            with dd1:
+                drill_symbol = st.selectbox("Company", sorted(table_df["symbol"].unique()), key="sd_drill_symbol")
+            years_for_symbol = sorted(table_df[table_df["symbol"] == drill_symbol]["fiscal_year"].unique().tolist())
+            with dd2:
+                drill_entry_year = st.selectbox("Entry year", years_for_symbol, key="sd_drill_year")
+
+            row = scored[(scored["symbol"] == drill_symbol) & (scored["fiscal_year"] == drill_entry_year)].iloc[0]
+            exit_year = int(row["exit_fiscal_year"])
+            exit_rows = outcomes_all[(outcomes_all["symbol"] == drill_symbol) & (outcomes_all["fiscal_year"] == exit_year)]
+            exit_date = pd.Timestamp(exit_rows.iloc[0]["available_date"]) if not exit_rows.empty else None
+            entry_date = pd.Timestamp(row["available_date"])
+
+            n_trans_slot = 1 if trans_delta_col else 0
+            metric_slots = st.columns(len(used_cols) + n_trans_slot + 3)
+            for i, col in enumerate(used_cols):
+                lbl = next(l for l, (c, k) in ENTRY_METRICS.items() if c == col)
+                kind = ENTRY_METRICS[lbl][1]
+                val = row[col]
+                disp = "—" if pd.isna(val) else (
+                    f"{val:.1f}%" if kind == "pct" else (f"{val:.2f}x" if kind == "ratio" else f"{val:,.0f}")
+                )
+                metric_slots[i].metric(lbl, disp)
+            slot_offset = len(used_cols)
+            if trans_delta_col:
+                val = row[trans_delta_col]
+                metric_slots[slot_offset].metric(f"{trans_label} Δ", "—" if pd.isna(val) else f"{val:+.1f}pp")
+                slot_offset += 1
+            for j, (lbl, key) in enumerate([
+                ("Revenue CAGR", "revenue_cagr_pct"), ("Profit CAGR", "profit_cagr_pct"), ("Stock CAGR", "stock_cagr_pct"),
+            ]):
+                val = row[key]
+                metric_slots[slot_offset + j].metric(lbl, "—" if pd.isna(val) else f"{val:+.1f}%")
+
+            prices = get_prices(drill_symbol)
+            if prices.empty:
+                st.caption("No price history for this company.")
+            else:
+                lo = entry_date - pd.DateOffset(months=6)
+                hi = (exit_date or entry_date + pd.DateOffset(years=horizon_years)) + pd.DateOffset(months=6)
+                window = prices[(prices["date"] >= lo) & (prices["date"] <= hi)]
+                fig_px = go.Figure(go.Scatter(x=window["date"], y=window["close"], mode="lines", name=drill_symbol))
+                fig_px.add_vline(x=entry_date, line_dash="dash", line_color="#66bb6a")
+                fig_px.add_annotation(x=entry_date, y=1, yref="paper", yanchor="bottom",
+                                       text="Entry", showarrow=False, font=dict(color="#66bb6a"))
+                if exit_date is not None:
+                    fig_px.add_vline(x=exit_date, line_dash="dash", line_color="#e57373")
+                    fig_px.add_annotation(x=exit_date, y=1, yref="paper", yanchor="bottom",
+                                           text="Exit", showarrow=False, font=dict(color="#e57373"))
+                fig_px.update_layout(height=320, margin=dict(l=10, r=10, t=30, b=10), yaxis_title="Close price (₹)")
+                st.plotly_chart(fig_px, width="stretch")
+
+            fund_window = outcomes_all[
+                (outcomes_all["symbol"] == drill_symbol)
+                & outcomes_all["fiscal_year"].between(drill_entry_year - 2, exit_year + 1)
+            ].sort_values("fiscal_year")
+            st.caption("Revenue and profit around the entry/exit window (highlighted) — the fundamentals story behind the price move.")
+            fc1, fc2 = st.columns(2)
+            bar_highlight = ["#66bb6a" if drill_entry_year <= y <= exit_year else "#9e9e9e" for y in fund_window["fiscal_year"]]
+            with fc1:
+                figr = go.Figure(go.Bar(x=fund_window["fiscal_year"], y=fund_window["sales_cr"], marker_color=bar_highlight))
+                figr.update_layout(title=dict(text="Revenue (₹cr)", font=dict(size=13)),
+                                    height=260, margin=dict(l=10, r=10, t=36, b=10))
+                st.plotly_chart(figr, width="stretch")
+            with fc2:
+                figp = go.Figure(go.Bar(x=fund_window["fiscal_year"], y=fund_window["net_profit_cr"], marker_color=bar_highlight))
+                figp.update_layout(title=dict(text="Net profit (₹cr)", font=dict(size=13)),
+                                    height=260, margin=dict(l=10, r=10, t=36, b=10))
+                st.plotly_chart(figp, width="stretch")
+
+    with st.expander(":material/warning: Caveats"):
+        st.markdown(
+            "- **Annual granularity only** — quarterly fundamentals are only a ~3-year trailing "
+            "window per company (not a real historical archive), too shallow for a 'how many times "
+            "in the past' question. Annual has ~10 years of depth on average.\n"
+            "- **Survivorship bias** — this screens *today's* ~1,150-symbol universe. Companies that "
+            "later delisted, got acquired, or fell out of the market-cap screen aren't here, which "
+            "tends to bias results optimistic.\n"
+            "- **Entry and exit prices are as-of the result's public release date** (no lookahead), "
+            "not the fiscal year-end — consistent with how PE is computed elsewhere in this app.\n"
+            "- **CAGR needs a positive base and a positive endpoint** — a loss-making entry or exit "
+            "year leaves that CAGR blank rather than showing a misleading number (there's no sane "
+            "geometric growth rate across a sign flip).\n"
+            "- **Rows are not independent trials** — the same company can match in several nearby "
+            "years, and those years' outcomes are correlated, so treat sample counts as an upper "
+            "bound on real statistical power, not a literal count of independent bets.\n"
+            "- **The baseline** is the same entry fiscal year(s) across the *whole* universe, not "
+            "all of history — it answers 'did this condition beat just buying broadly in the same "
+            "years', which controls for market-wide moves your matches would otherwise get credit for.\n"
+            "- **Turnaround condition uses hindsight by design** — entry is dated at the jump year, "
+            "but confirming it 'held' for the following year(s) requires data from *after* the entry "
+            "year. This studies 'when a change like this turns out to be real, what tends to follow', "
+            "not a signal you could have acted on in real time without waiting to see if it stuck."
+        )
 
 if section == "Fundamentals":
     st.caption(
