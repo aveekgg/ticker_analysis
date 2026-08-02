@@ -328,14 +328,21 @@ def get_mcap_map() -> pd.DataFrame:
 
 
 def mcap_segment(mcap_cr: float) -> str:
-    """Approximate AMFI-style size buckets (thresholds in ₹ crore)."""
+    """Approximate AMFI-style size buckets (thresholds in ₹ crore), with the
+    small-cap band further split at ₹5,000cr -- the AMFI small/mid/large split
+    alone still lumps a ₹32,000cr company in with a ₹500cr one."""
     if pd.isna(mcap_cr):
         return "Unknown"
     if mcap_cr >= 100_000:
         return "Large (>1L cr)"
     if mcap_cr >= 33_000:
         return "Mid (33k-1L cr)"
-    return "Small (<33k cr)"
+    if mcap_cr >= 5_000:
+        return "Small (5k-33k cr)"
+    return "Micro (<5k cr)"
+
+
+MCAP_SEGMENT_ORDER = ["Large (>1L cr)", "Mid (33k-1L cr)", "Small (5k-33k cr)", "Micro (<5k cr)", "Unknown"]
 
 
 def mcap_ladder(max_cr: float) -> list:
@@ -389,6 +396,23 @@ FUNDAMENTALS_TABS = [
     ("quarters", "Quarterly results"), ("profit_loss", "Profit & loss"),
     ("balance_sheet", "Balance sheet"), ("cash_flow", "Cash flow"), ("ratios", "Ratios"),
 ]
+
+
+def ordered_metrics_for_period(raw: pd.DataFrame, period_type: str) -> list:
+    """Metric names available for one company at annual/quarterly granularity,
+    in screener's own row order (concatenated across its annual statements, or
+    just the quarters order for quarterly) so the chart's metric picker reads
+    top-to-bottom the same as the tables below it -- with any metric outside
+    the canonical order (e.g. ROE % for financials) appended alphabetically."""
+    available = set(raw[raw["period_type"] == period_type]["metric"])
+    if period_type == "quarterly":
+        order = FUNDAMENTALS_METRIC_ORDER.get("quarters", [])
+    else:
+        order = [m for stmt in ("profit_loss", "balance_sheet", "cash_flow", "ratios")
+                 for m in FUNDAMENTALS_METRIC_ORDER.get(stmt, [])]
+    ordered = [m for m in order if m in available]
+    ordered += sorted(available - set(ordered))
+    return ordered
 
 
 @st.cache_data
@@ -2118,7 +2142,8 @@ if section == "Sector fundamentals":
                 )
 
                 st.caption(f"Same data as a heatmap — every filtered constituent's **{sf_metric_label}** "
-                           f"by year, ranked by revenue in {drill_year}.")
+                           f"by year, grouped by current market-cap tier (so a small-cap's growth isn't "
+                           f"visually stacked against a behemoth's), ranked by revenue within each tier.")
                 filtered_syms = filtered_df["symbol"].tolist()
                 if not filtered_syms:
                     st.caption("No companies match the current filters — loosen them above.")
@@ -2129,7 +2154,14 @@ if section == "Sector fundamentals":
                     full_sector_pivot = sf_raw[sf_raw["group_name"] == drill_group].pivot_table(
                         index="symbol", columns="fiscal_year", values=sf_raw_col, aggfunc="first"
                     )
-                    comp_pivot = full_sector_pivot.reindex(filtered_syms)
+                    # Group by market-cap tier (stable sort keeps the existing
+                    # revenue-descending order within each tier).
+                    sym_to_seg = filtered_df.set_index("symbol")["mcap_cr"].map(mcap_segment).to_dict()
+                    seg_rank = {seg: i for i, seg in enumerate(MCAP_SEGMENT_ORDER)}
+                    filtered_syms_grouped = sorted(
+                        filtered_syms, key=lambda s: seg_rank.get(sym_to_seg.get(s, "Unknown"), len(MCAP_SEGMENT_ORDER))
+                    )
+                    comp_pivot = full_sector_pivot.reindex(filtered_syms_grouped)
                     max_n = len(comp_pivot)
                     top_n = st.slider(
                         "Companies to show", 1, max_n, min(20, max_n), key="sf_drill_top_n",
@@ -2148,15 +2180,31 @@ if section == "Sector fundamentals":
                         comp_diverging, comp_cbar_title = True, f"{sf_metric_label} — vs. sector median YoY Δ"
 
                     comp_zmax = comp_display.abs().max().max() if comp_diverging and comp_display.notna().any().any() else None
-                    fig4 = go.Figure(data=go.Heatmap(
-                        z=comp_display.values, x=[str(y) for y in comp_display.columns], y=comp_display.index,
-                        colorscale="RdYlGn" if comp_diverging else "Blues",
-                        zmid=0 if comp_diverging else None,
-                        zmin=-comp_zmax if comp_zmax else None, zmax=comp_zmax if comp_zmax else None,
-                        texttemplate="%{z:" + fmt + "}", hovertemplate="%{y} · %{x}: %{z:" + fmt + "}<extra></extra>",
-                        colorbar_title=comp_cbar_title,
-                    ))
-                    fig4.update_layout(height=max(220, 26 * len(comp_display) + 80), margin=dict(l=10, r=10, t=10, b=10))
+                    row_segments = [sym_to_seg.get(s, "Unknown") for s in comp_display.index]
+                    present_segments = [seg for seg in MCAP_SEGMENT_ORDER if seg in row_segments]
+                    seg_counts = {seg: row_segments.count(seg) for seg in present_segments}
+
+                    fig4 = make_subplots(
+                        rows=len(present_segments), cols=1, shared_xaxes=True,
+                        row_heights=[seg_counts[seg] for seg in present_segments],
+                        vertical_spacing=min(0.15, 1.2 / max(1, len(comp_display))),
+                        subplot_titles=[f"{seg} — {seg_counts[seg]} co." for seg in present_segments],
+                    )
+                    for i, seg in enumerate(present_segments, start=1):
+                        seg_rows = [s for s, sg in zip(comp_display.index, row_segments) if sg == seg]
+                        sub = comp_display.loc[seg_rows]
+                        fig4.add_trace(go.Heatmap(
+                            z=sub.values, x=[str(y) for y in sub.columns], y=sub.index,
+                            colorscale="RdYlGn" if comp_diverging else "Blues",
+                            zmid=0 if comp_diverging else None,
+                            zmin=-comp_zmax if comp_zmax else None, zmax=comp_zmax if comp_zmax else None,
+                            texttemplate="%{z:" + fmt + "}", hovertemplate="%{y} · %{x}: %{z:" + fmt + "}<extra></extra>",
+                            showscale=(i == 1), colorbar=dict(title=comp_cbar_title) if i == 1 else None,
+                        ), row=i, col=1)
+                    fig4.update_layout(
+                        height=max(280, 26 * len(comp_display) + 50 * len(present_segments) + 40),
+                        margin=dict(l=10, r=10, t=30, b=10),
+                    )
                     st.plotly_chart(fig4, width="stretch")
             else:
                 st.caption("No years with data for this sector.")
@@ -2276,13 +2324,90 @@ if section == "Fundamentals":
             f"side by side — **{basis}** figures, scraped {scraped_at:%Y-%m-%d %H:%M} UTC."
         )
 
+        raw = get_fundamentals_raw(fund_symbol)
+        projections = get_projections(fund_symbol)
+
+        st.subheader(":material/show_chart: Chart view")
+        if raw.empty:
+            st.caption("No data to chart.")
+        else:
+            cv1, cv2, cv3 = st.columns([1, 3, 1.3], vertical_alignment="bottom")
+            with cv1:
+                chart_period_label = st.segmented_control(
+                    "Period", ["Annual", "Quarterly"], default="Annual", key="fund_chart_period",
+                )
+                chart_period_label = chart_period_label or "Annual"
+            chart_period = "annual" if chart_period_label == "Annual" else "quarterly"
+            available_metrics = ordered_metrics_for_period(raw, chart_period)
+            default_metrics = [m for m in ["Sales", "Net Profit"] if m in available_metrics] \
+                or available_metrics[:1]
+            with cv2:
+                chart_metrics = st.multiselect(
+                    "Metrics", available_metrics, default=default_metrics, key=f"fund_chart_metrics_{chart_period}",
+                )
+            with cv3:
+                normalize = st.checkbox(
+                    "Normalize to 100", key="fund_chart_normalize",
+                    help="Index every selected metric to 100 at its first shown period, so metrics "
+                    "with different units (₹cr vs % vs days) can be compared on one axis by growth "
+                    "trajectory instead of absolute scale.",
+                )
+
+            if not chart_metrics:
+                st.info("Pick at least one metric to chart.")
+            elif not available_metrics:
+                st.caption(f"No {chart_period_label.lower()} data for {fund_symbol}.")
+            else:
+                chart_raw = raw[(raw["period_type"] == chart_period) & (raw["metric"].isin(chart_metrics))].copy()
+                chart_raw["period_end"] = pd.to_datetime(chart_raw["period_end"])
+                figc = go.Figure()
+                unit_axis, units_present = {}, []
+                for metric in chart_metrics:
+                    series = chart_raw[chart_raw["metric"] == metric].dropna(subset=["value"]).sort_values("period_end")
+                    if series.empty:
+                        continue
+                    unit = series["unit"].iloc[0]
+                    y = series["value"]
+                    hover_suffix = ""
+                    if normalize:
+                        first = y.iloc[0]
+                        if first:
+                            y = y / first * 100
+                            hover_suffix = " (indexed)"
+                        axis = "y"
+                    else:
+                        if unit not in unit_axis:
+                            unit_axis[unit] = "y" if not unit_axis else "y2"
+                            units_present.append(unit)
+                        axis = unit_axis[unit]
+                    figc.add_trace(go.Scatter(
+                        x=series["period_end"], y=y, mode="lines+markers", name=metric, yaxis=axis,
+                        hovertemplate=f"{metric}" + "<br>%{x|%b %Y}: %{y:,.1f}" + hover_suffix + "<extra></extra>",
+                    ))
+                layout_kwargs = dict(
+                    height=420, margin=dict(l=10, r=10, t=30, b=10),
+                    legend=dict(orientation="h", yanchor="bottom", y=1.02),
+                )
+                if normalize:
+                    layout_kwargs["yaxis"] = dict(title="Indexed to 100")
+                else:
+                    if units_present:
+                        layout_kwargs["yaxis"] = dict(title=units_present[0])
+                    if len(units_present) > 1:
+                        layout_kwargs["yaxis2"] = dict(title=units_present[1], overlaying="y", side="right")
+                    if len(units_present) > 2:
+                        st.caption(
+                            f":material/warning: **{', '.join(units_present[2:])}** share the right "
+                            f"axis with **{units_present[1]}** — scales may not line up. Check "
+                            "**Normalize to 100** or pick metrics with matching units."
+                        )
+                figc.update_layout(**layout_kwargs)
+                st.plotly_chart(figc, width="stretch")
+
         # Single scrolling page instead of tabs -- the jump links get you to a
         # section quickly, but plain scrolling lets you see two sections at
         # once (e.g. OPM % next to ROCE %), which switching tabs didn't allow.
         st.markdown(" · ".join(f"[{label}](#{statement})" for statement, label in FUNDAMENTALS_TABS))
-
-        raw = get_fundamentals_raw(fund_symbol)
-        projections = get_projections(fund_symbol)
 
         for statement, label in FUNDAMENTALS_TABS:
             st.subheader(label, anchor=statement)
@@ -2401,7 +2526,12 @@ if section == "Fundamentals":
             "on Profit & loss / Ratios — editable tables can't also support range selection in "
             "Streamlit, so those two trade stats for direct cell entry.\n"
             "- **Projections & notes are yours** — saved locally in `fundamentals_user_data.duckdb`, "
-            "separate from the scraped data, and not touched by re-scraping."
+            "separate from the scraped data, and not touched by re-scraping.\n"
+            "- **Chart view**: pick any metrics (annual or quarterly) to plot over time. Metrics "
+            "sharing a unit share an axis; a second unit gets its own right-hand axis; a third+ "
+            "unit shares the right axis (scales won't line up — use **Normalize to 100** instead, "
+            "which indexes every series to its first shown period so growth trajectories compare "
+            "cleanly regardless of units)."
         )
 
 if section == "Query / Tables":
